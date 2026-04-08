@@ -7,7 +7,9 @@
 """
 Baseline inference script for the Adaptive Supply Chain RL Environment.
 
-Uses Google Gemini 2.0 Flash (via OpenAI-compatible endpoint) as the agent.
+Uses a Hugging Face model via the OpenAI-compatible Inference API.
+Defaults to meta-llama/Meta-Llama-3.1-8B-Instruct (override with HF_MODEL env var).
+
 Runs 3 fixed-difficulty episodes (easy → medium → hard) and prints grader scores.
 
 Reproducibility:
@@ -18,11 +20,15 @@ Reproducibility:
 Prerequisites:
   1. Server running at http://localhost:8000:
        uvicorn server.app:app --host 0.0.0.0 --port 8000
-  2. GEMINI_API_KEY environment variable:
-       export GEMINI_API_KEY=your_key   # free at aistudio.google.com
+
+  2. Hugging Face token (free at https://huggingface.co/settings/tokens):
+       export HF_TOKEN=hf_your_token_here
+
+  3. (Optional) Override the model:
+       export HF_MODEL=Qwen/Qwen2.5-7B-Instruct
 
 Usage:
-  GEMINI_API_KEY=your_key python inference.py
+  HF_TOKEN=hf_... python inference.py
 """
 
 import json
@@ -43,30 +49,34 @@ from graders import PhaseHistory, grade_easy_phase, grade_hard_phase, grade_medi
 np.random.seed(42)
 EPISODE_SEED = 0
 
-# ── Gemini client ────────────────────────────────────────────────────────────
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
+# ── Hugging Face client (OpenAI-compatible Inference API) ────────────────────
+HF_TOKEN = os.environ.get("HF_TOKEN")
+if not HF_TOKEN:
     sys.exit(
-        "Error: GEMINI_API_KEY is not set.\n"
-        "Get a free key at https://aistudio.google.com and run:\n"
-        "    export GEMINI_API_KEY=your_key"
+        "Error: HF_TOKEN is not set.\n"
+        "Get a free token at https://huggingface.co/settings/tokens and run:\n"
+        "    export HF_TOKEN=hf_your_token_here"
     )
 
+# Default: Meta-Llama-3.1-8B-Instruct (free serverless tier on HF)
+# Override via:  export HF_MODEL=Qwen/Qwen2.5-7B-Instruct
+HF_MODEL = os.environ.get("HF_MODEL", "meta-llama/Meta-Llama-3.1-8B-Instruct")
+
 llm = openai.OpenAI(
-    api_key=GEMINI_API_KEY,
-    base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+    api_key=HF_TOKEN,
+    base_url="https://api-inference.huggingface.co/v1/",
 )
 
 GRADERS = {
-    "easy": grade_easy_phase,
+    "easy":   grade_easy_phase,
     "medium": grade_medium_phase,
-    "hard": grade_hard_phase,
+    "hard":   grade_hard_phase,
 }
 
 TASK_IDS = {
-    "easy": "easy_phase_inventory",
+    "easy":   "easy_phase_inventory",
     "medium": "medium_phase_inventory",
-    "hard": "hard_phase_inventory",
+    "hard":   "hard_phase_inventory",
 }
 
 
@@ -76,11 +86,10 @@ def parse_action(content: str) -> tuple[SupplyChainAction, bool]:
     """
     Extract a SupplyChainAction from the LLM's text response.
 
-    Returns:
-        (action, is_valid) — is_valid=False if parsing failed (falls back to hold).
+    Returns (action, is_valid). Falls back to hold on any parse failure.
 
-    LLM outputs {"action": "order", "quantity": 100};
-    our model uses "action_type" — we remap the key here.
+    LLM is prompted to output {"action": "order", "quantity": 100};
+    we remap the "action" key to "action_type" for our Pydantic model.
     """
     try:
         match = re.search(r"\{[^{}]+\}", content, re.DOTALL)
@@ -108,8 +117,8 @@ def run_episode(env: AscAgentUnderDemandUncertainityRlEnv, difficulty: str) -> P
     """
     Run a 30-step episode at the given difficulty and return a PhaseHistory.
 
-    Demand and fulfillment are read from observation metadata (actual values,
-    not forecast proxies) for accurate grader computation.
+    Uses actual_demand / actual_fulfilled from observation metadata for
+    accurate (non-forecast-proxy) grader computation.
     """
     task_id = TASK_IDS[difficulty]
     result = env.reset(task=task_id, seed=EPISODE_SEED)
@@ -122,19 +131,22 @@ def run_episode(env: AscAgentUnderDemandUncertainityRlEnv, difficulty: str) -> P
     total_actions: int = 0
     episode_reward: float = 0.0
 
-    print(f"\n{'─' * 68}")
-    print(f"  Phase: {difficulty.upper():6s}  |  Starting stock: {obs.current_stock}  |  Budget: ${obs.budget_remaining:.0f}")
-    print(f"{'─' * 68}")
-    print(f"  {'Day':>3}  {'Stock':>5}  {'Action':<24}  {'Qty':>5}  {'Reward':>8}  {'SL':>6}  {'Score':>6}")
-    print(f"  {'─'*3}  {'─'*5}  {'─'*24}  {'─'*5}  {'─'*8}  {'─'*6}  {'─'*6}")
+    print(f"\n{'─' * 70}")
+    print(
+        f"  Phase : {difficulty.upper():6s}  |  Model: {HF_MODEL}\n"
+        f"  Stock : {obs.current_stock}   |  Budget: ${obs.budget_remaining:.0f}"
+    )
+    print(f"{'─' * 70}")
+    print(f"  {'Day':>3}  {'Stock':>5}  {'Action':<22}  {'Qty':>5}  {'Reward':>8}  {'SL':>6}  {'Score':>6}")
+    print(f"  {'─'*3}  {'─'*5}  {'─'*22}  {'─'*5}  {'─'*8}  {'─'*6}  {'─'*6}")
 
     done = result.done
 
     while not done:
-        # Query LLM
+        # Query HF model
         try:
             response = llm.chat.completions.create(
-                model="gemini-2.0-flash",
+                model=HF_MODEL,
                 messages=[{"role": "user", "content": obs.prompt}],
                 temperature=0.0,
                 max_tokens=64,
@@ -155,15 +167,14 @@ def run_episode(env: AscAgentUnderDemandUncertainityRlEnv, difficulty: str) -> P
         elif action.action_type == "emergency_restock" and action.quantity:
             total_cost += 20 + action.quantity * 6
 
-        # Step
         step_result = env.step(action)
         next_obs = step_result.observation
 
-        # Use ACTUAL demand/fulfilled from metadata (not forecast proxies)
+        # Accurate demand/fulfilled from metadata (not forecast proxies)
         meta = next_obs.metadata or {}
-        actual_demand = meta.get("actual_demand", obs.demand_forecast)
+        actual_demand    = meta.get("actual_demand",    obs.demand_forecast)
         actual_fulfilled = meta.get("actual_fulfilled", 0.0)
-        phase_score = meta.get("phase_score", 0.0)
+        phase_score      = meta.get("phase_score",      0.0)
 
         demand_history.append(actual_demand)
         fulfilled_history.append(actual_fulfilled)
@@ -171,15 +182,15 @@ def run_episode(env: AscAgentUnderDemandUncertainityRlEnv, difficulty: str) -> P
 
         qty_str = str(action.quantity) if action.quantity is not None else "—"
         print(
-            f"  {obs.day:3d}  {obs.current_stock:5d}  {action.action_type:<24s}  "
+            f"  {obs.day:3d}  {obs.current_stock:5d}  {action.action_type:<22s}  "
             f"{qty_str:>5}  {step_result.reward:+8.1f}  "
             f"{next_obs.last_7_day_service_level:6.0%}  {phase_score:6.3f}"
         )
 
-        obs = next_obs
+        obs  = next_obs
         done = step_result.done
 
-    print(f"{'─' * 68}")
+    print(f"{'─' * 70}")
     print(f"  Episode total reward: {episode_reward:+.1f}  |  Valid actions: {valid_actions}/{total_actions}")
 
     return PhaseHistory(
@@ -195,9 +206,10 @@ def run_episode(env: AscAgentUnderDemandUncertainityRlEnv, difficulty: str) -> P
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    print("\n" + "═" * 68)
-    print("  ADAPTIVE SUPPLY CHAIN RL — BASELINE INFERENCE (Gemini 2.0 Flash)")
-    print("═" * 68)
+    print("\n" + "═" * 70)
+    print(f"  ADAPTIVE SUPPLY CHAIN RL — BASELINE INFERENCE")
+    print(f"  Model : {HF_MODEL}")
+    print("═" * 70)
 
     env = AscAgentUnderDemandUncertainityRlEnv(base_url="http://localhost:8000")
     scores: dict[str, float] = {}
@@ -205,20 +217,20 @@ def main():
     with env:
         for difficulty in ("easy", "medium", "hard"):
             history = run_episode(env, difficulty)
-            score = GRADERS[difficulty](history)
+            score   = GRADERS[difficulty](history)
             scores[difficulty] = score
             print(f"  → Grader score ({difficulty}): {score:.4f}\n")
 
-    print("═" * 68)
+    print("═" * 70)
     print("  FINAL GRADER SCORES")
-    print("═" * 68)
+    print("═" * 70)
     for phase, score in scores.items():
         bar = "█" * int(score * 30)
         print(f"  {phase:<8s}: {score:.4f}  {bar}")
     overall = sum(scores.values()) / len(scores)
-    print(f"{'─' * 68}")
+    print(f"{'─' * 70}")
     print(f"  Overall  : {overall:.4f}")
-    print("═" * 68 + "\n")
+    print("═" * 70 + "\n")
 
 
 if __name__ == "__main__":

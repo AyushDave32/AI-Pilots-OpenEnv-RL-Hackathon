@@ -193,14 +193,17 @@ docker build -t asc-supply-chain:latest -f Dockerfile .
 docker run -p 8000:8000 asc-supply-chain:latest
 ```
 
-### Run Baseline Inference (Gemini 2.0 Flash)
+### Run Baseline Inference (Hugging Face LLM)
 
 ```bash
-# Requires a free API key from https://aistudio.google.com
-export GEMINI_API_KEY=your_key
+# Requires a free HF token from https://huggingface.co/settings/tokens
+export HF_TOKEN=hf_your_token_here
 
 # Start server first, then:
 python inference.py
+
+# Override the model (default: meta-llama/Meta-Llama-3.1-8B-Instruct)
+HF_MODEL=Qwen/Qwen2.5-7B-Instruct python inference.py
 ```
 
 ---
