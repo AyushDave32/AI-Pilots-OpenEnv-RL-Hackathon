@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Asc Agent Under Demand Uncertainity Rl Env Environment Client."""
+"""Adaptive Supply Chain RL Environment — Python client."""
 
 from typing import Dict
 
@@ -12,87 +12,90 @@ from openenv.core import EnvClient
 from openenv.core.client_types import StepResult
 from openenv.core.env_server.types import State
 
-from .models import AscAgentUnderDemandUncertainityRlAction, AscAgentUnderDemandUncertainityRlObservation
+from .models import PendingOrder, SupplyChainAction, SupplyChainObservation
 
 
 class AscAgentUnderDemandUncertainityRlEnv(
-    EnvClient[AscAgentUnderDemandUncertainityRlAction, AscAgentUnderDemandUncertainityRlObservation, State]
+    EnvClient[SupplyChainAction, SupplyChainObservation, State]
 ):
     """
-    Client for the Asc Agent Under Demand Uncertainity Rl Env Environment.
+    Client for the Adaptive Supply Chain RL Environment.
 
-    This client maintains a persistent WebSocket connection to the environment server,
-    enabling efficient multi-step interactions with lower latency.
-    Each client instance has its own dedicated environment session on the server.
+    Maintains a persistent WebSocket connection to the server for low-latency
+    multi-step interactions.
 
     Example:
-        >>> # Connect to a running server
-        >>> with AscAgentUnderDemandUncertainityRlEnv(base_url="http://localhost:8000") as client:
-        ...     result = client.reset()
-        ...     print(result.observation.echoed_message)
-        ...
-        ...     result = client.step(AscAgentUnderDemandUncertainityRlAction(message="Hello!"))
-        ...     print(result.observation.echoed_message)
+        >>> with AscAgentUnderDemandUncertainityRlEnv(base_url="http://localhost:8000") as env:
+        ...     result = env.reset()
+        ...     print(result.observation.current_stock)
+        ...     result = env.step(SupplyChainAction(action_type="order", quantity=100))
+        ...     print(result.observation.reward)
 
     Example with Docker:
-        >>> # Automatically start container and connect
-        >>> client = AscAgentUnderDemandUncertainityRlEnv.from_docker_image("asc_agent_under_demand_uncertainity_rl_env-env:latest")
+        >>> env = AscAgentUnderDemandUncertainityRlEnv.from_docker_image("asc-supply-chain:latest")
         >>> try:
-        ...     result = client.reset()
-        ...     result = client.step(AscAgentUnderDemandUncertainityRlAction(message="Test"))
+        ...     result = env.reset()
+        ...     result = env.step(SupplyChainAction(action_type="hold"))
         ... finally:
-        ...     client.close()
+        ...     env.close()
     """
 
-    def _step_payload(self, action: AscAgentUnderDemandUncertainityRlAction) -> Dict:
-        """
-        Convert AscAgentUnderDemandUncertainityRlAction to JSON payload for step message.
+    def _step_payload(self, action: SupplyChainAction) -> Dict:
+        """Convert SupplyChainAction to JSON payload."""
+        payload = {"action_type": action.action_type}
+        if action.quantity is not None:
+            payload["quantity"] = action.quantity
+        return payload
 
-        Args:
-            action: AscAgentUnderDemandUncertainityRlAction instance
-
-        Returns:
-            Dictionary representation suitable for JSON encoding
-        """
-        return {
-            "message": action.message,
-        }
-
-    def _parse_result(self, payload: Dict) -> StepResult[AscAgentUnderDemandUncertainityRlObservation]:
-        """
-        Parse server response into StepResult[AscAgentUnderDemandUncertainityRlObservation].
-
-        Args:
-            payload: JSON response data from server
-
-        Returns:
-            StepResult with AscAgentUnderDemandUncertainityRlObservation
-        """
+    def _parse_result(self, payload: Dict) -> StepResult[SupplyChainObservation]:
+        """Parse server response into StepResult[SupplyChainObservation]."""
         obs_data = payload.get("observation", {})
-        observation = AscAgentUnderDemandUncertainityRlObservation(
-            echoed_message=obs_data.get("echoed_message", ""),
-            message_length=obs_data.get("message_length", 0),
-            done=payload.get("done", False),
-            reward=payload.get("reward"),
+
+        # done and reward may be at top level or nested in obs_data
+        done = payload.get("done", obs_data.get("done", False))
+        reward = payload.get("reward", obs_data.get("reward", 0.0))
+
+        # Reconstruct pending_orders as PendingOrder objects
+        raw_orders = obs_data.get("pending_orders", [])
+        pending_orders = [
+            PendingOrder(
+                quantity=po["quantity"],
+                arrives_in_days=po["arrives_in_days"],
+            )
+            if isinstance(po, dict)
+            else po
+            for po in raw_orders
+        ]
+
+        observation = SupplyChainObservation(
+            day=obs_data.get("day", 1),
+            current_stock=obs_data.get("current_stock", 0),
+            demand_forecast=obs_data.get("demand_forecast", 0.0),
+            forecast_noise=obs_data.get("forecast_noise", "low"),
+            pending_orders=pending_orders,
+            last_7_day_service_level=obs_data.get("last_7_day_service_level", 1.0),
+            holding_cost_per_unit=obs_data.get("holding_cost_per_unit", 0.5),
+            stockout_penalty=obs_data.get("stockout_penalty", 50.0),
+            budget_remaining=obs_data.get("budget_remaining", 0.0),
+            supplier_status=obs_data.get("supplier_status", "normal"),
+            current_phase=obs_data.get("current_phase", "easy"),
+            prompt=obs_data.get("prompt", ""),
+            phase_score=obs_data.get("phase_score", 0.0),
+            actual_demand=obs_data.get("actual_demand", 0.0),
+            actual_fulfilled=obs_data.get("actual_fulfilled", 0.0),
+            done=done,
+            reward=reward,
             metadata=obs_data.get("metadata", {}),
         )
 
         return StepResult(
             observation=observation,
-            reward=payload.get("reward"),
-            done=payload.get("done", False),
+            reward=reward,
+            done=done,
         )
 
     def _parse_state(self, payload: Dict) -> State:
-        """
-        Parse server response into State object.
-
-        Args:
-            payload: JSON response from state request
-
-        Returns:
-            State object with episode_id and step_count
-        """
+        """Parse server response into State object."""
         return State(
             episode_id=payload.get("episode_id"),
             step_count=payload.get("step_count", 0),
