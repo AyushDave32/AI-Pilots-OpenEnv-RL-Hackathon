@@ -1,6 +1,6 @@
 ---
-title: Asc Agent Under Demand Uncertainity Rl Env Environment Server
-emoji: 🎹
+title: Adaptive Supply Chain Agent Under Demand Uncertainty RL Environment
+emoji: 🏭
 colorFrom: yellow
 colorTo: red
 sdk: docker
@@ -9,247 +9,247 @@ app_port: 8000
 base_path: /web
 tags:
   - openenv
+  - reinforcement-learning
+  - supply-chain
+  - curriculum-learning
 ---
 
-# Asc Agent Under Demand Uncertainity Rl Env Environment
+# Adaptive Supply Chain RL Environment
 
-A simple test environment that echoes back messages. Perfect for testing the env APIs as well as demonstrating environment usage patterns.
+An **OpenEnv-compliant RL environment** for the Meta / PyTorch / Hugging Face OpenEnv Hackathon.
+
+The agent plays a **warehouse manager** making daily inventory ordering decisions over a **30-day episode** under uncertain demand, variable supplier lead times, and a multi-component reward function. Difficulty escalates automatically through three curriculum phases.
+
+---
+
+## The Problem
+
+> *"You manage a warehouse. Every day you decide how much stock to order. Demand is uncertain, suppliers are unreliable, and holding too much stock is as costly as running out."*
+
+The agent must balance:
+- **Ordering cost** — fixed + per-unit cost to place orders
+- **Stockout risk** — large penalty if demand exceeds available stock
+- **Overstock waste** — penalty for carrying more than 200 units
+- **Service level** — fraction of demand successfully fulfilled
+
+---
+
+## Curriculum Phases
+
+A **single environment** automatically advances through 3 difficulty phases based on recent performance:
+
+```
+Day 1 ──► [EASY] ──(7-day service level > 90%)──► [MEDIUM] ──(90% again)──► [HARD] ──► Day 30
+```
+
+| Phase  | Demand Pattern               | Lead Time       | Forecast Noise | Service Target |
+|--------|------------------------------|-----------------|----------------|----------------|
+| Easy   | Stable ~80 units/day         | Fixed 3 days    | ±10%           | 95%            |
+| Medium | Seasonal wave (peak day 15)  | 2–5 days random | ±25%           | 85%            |
+| Hard   | Baseline + random spikes     | 2–10 days + delays | ±40%        | 75%            |
+
+Each phase is also exposed as an **independent task** for direct evaluation:
+- `easy_phase_inventory`
+- `medium_phase_inventory`
+- `hard_phase_inventory`
+
+---
+
+## Action Space
+
+**`SupplyChainAction`**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `action_type` | `"order"` \| `"emergency_restock"` \| `"hold"` | What to do today |
+| `quantity` | `int` \| `None` | Units to order (required for order/emergency; `None` for hold) |
+
+```json
+{"action_type": "order", "quantity": 150}
+{"action_type": "emergency_restock", "quantity": 50}
+{"action_type": "hold"}
+```
+
+---
+
+## Observation Space
+
+**`SupplyChainObservation`**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `day` | `int` | Current day (1–30) |
+| `current_stock` | `int` | Units currently in warehouse |
+| `demand_forecast` | `float` | Forecasted demand for today |
+| `forecast_noise` | `"low"` \| `"medium"` \| `"high"` | Forecast uncertainty level |
+| `pending_orders` | `List[PendingOrder]` | Orders placed but not yet arrived |
+| `last_7_day_service_level` | `float` | Fraction of demand fulfilled over last 7 days |
+| `holding_cost_per_unit` | `float` | $0.50 per unit per day |
+| `stockout_penalty` | `float` | $50 per stockout event |
+| `budget_remaining` | `float` | Remaining budget in dollars |
+| `supplier_status` | `"normal"` \| `"delayed"` | Current supplier reliability |
+| `current_phase` | `"easy"` \| `"medium"` \| `"hard"` | Active difficulty phase |
+| `prompt` | `str` | Formatted natural-language prompt for LLM agents |
+| `done` | `bool` | True after day 30 |
+| `reward` | `float` | Step reward (dense, every step) |
+| `metadata` | `dict` | `phase_score`, `actual_demand`, `actual_fulfilled`, etc. |
+
+---
+
+## Reward Function
+
+Reward is **dense** — the agent receives a signal every step:
+
+```
+reward  = fulfilled_units × 3.0          # sell at $3/unit → $1 margin over $2 unit cost
+reward -= 50.0                            # if stockout occurred
+reward -= 0.5 × max(0, stock − 200)      # overstock penalty
+reward -= (20 + qty × 2)                 # if action = order
+reward -= (20 + qty × 6)                 # if action = emergency_restock
+reward += 5.0                            # if stock in [50, 200]  (efficiency bonus)
+reward -= 10.0                           # if action was malformed
+```
+
+**Optimal stock range: 50–200 units.** Below 50 risks stockouts; above 200 wastes holding cost.
+
+---
+
+## Grading (0.0–1.0)
+
+Each phase is scored independently:
+
+```
+score = 0.5 × service_score + 0.3 × cost_score + 0.2 × validity_score
+
+service_score  = min(avg_service_level / phase_target, 1.0)
+cost_score     = max(0.0, 1.0 − total_cost / max_allowed_cost)
+validity_score = valid_actions / total_actions
+```
+
+Live `phase_score` is available in every observation's `metadata` field.
+
+---
 
 ## Quick Start
 
-The simplest way to use the Asc Agent Under Demand Uncertainity Rl Env environment is through the `AscAgentUnderDemandUncertainityRlEnv` class:
+### Python Client
 
 ```python
-from asc_agent_under_demand_uncertainity_rl_env import AscAgentUnderDemandUncertainityRlAction, AscAgentUnderDemandUncertainityRlEnv
+from asc_agent_under_demand_uncertainity_rl_env import (
+    AscAgentUnderDemandUncertainityRlEnv,
+    SupplyChainAction,
+)
 
-try:
-    # Create environment from Docker image
-    asc_agent_under_demand_uncertainity_rl_envenv = AscAgentUnderDemandUncertainityRlEnv.from_docker_image("asc_agent_under_demand_uncertainity_rl_env-env:latest")
+with AscAgentUnderDemandUncertainityRlEnv(base_url="http://localhost:8000") as env:
+    result = env.reset()
+    obs = result.observation
+    print(f"Day {obs.day} | Stock: {obs.current_stock} | Phase: {obs.current_phase}")
 
-    # Reset
-    result = asc_agent_under_demand_uncertainity_rl_envenv.reset()
-    print(f"Reset: {result.observation.echoed_message}")
-
-    # Send multiple messages
-    messages = ["Hello, World!", "Testing echo", "Final message"]
-
-    for msg in messages:
-        result = asc_agent_under_demand_uncertainity_rl_envenv.step(AscAgentUnderDemandUncertainityRlAction(message=msg))
-        print(f"Sent: '{msg}'")
-        print(f"  → Echoed: '{result.observation.echoed_message}'")
-        print(f"  → Length: {result.observation.message_length}")
-        print(f"  → Reward: {result.reward}")
-
-finally:
-    # Always clean up
-    asc_agent_under_demand_uncertainity_rl_envenv.close()
+    while not result.done:
+        action = SupplyChainAction(action_type="order", quantity=100)
+        result = env.step(action)
+        obs = result.observation
+        print(
+            f"Day {obs.day:2d} | Stock: {obs.current_stock:4d} "
+            f"| Reward: {result.reward:+.1f} "
+            f"| SL: {obs.last_7_day_service_level:.0%} "
+            f"| Phase score: {obs.metadata['phase_score']:.3f}"
+        )
 ```
 
-That's it! The `AscAgentUnderDemandUncertainityRlEnv.from_docker_image()` method handles:
-- Starting the Docker container
-- Waiting for the server to be ready
-- Connecting to the environment
-- Container cleanup when you call `close()`
+### Start a Specific Phase
 
-## Building the Docker Image
-
-Before using the environment, you need to build the Docker image:
-
-```bash
-# From project root
-docker build -t asc_agent_under_demand_uncertainity_rl_env-env:latest -f server/Dockerfile .
+```python
+result = env.reset(task="hard_phase_inventory", seed=42)
 ```
 
-## Deploying to Hugging Face Spaces
+---
 
-You can easily deploy your OpenEnv environment to Hugging Face Spaces using the `openenv push` command:
-
-```bash
-# From the environment directory (where openenv.yaml is located)
-openenv push
-
-# Or specify options
-openenv push --namespace my-org --private
-```
-
-The `openenv push` command will:
-1. Validate that the directory is an OpenEnv environment (checks for `openenv.yaml`)
-2. Prepare a custom build for Hugging Face Docker space (enables web interface)
-3. Upload to Hugging Face (ensuring you're logged in)
+## Setup
 
 ### Prerequisites
 
-- Authenticate with Hugging Face: The command will prompt for login if not already authenticated
+- Python ≥ 3.10
+- [`uv`](https://docs.astral.sh/uv/) package manager
+- Docker (for containerised deployment)
 
-### Options
-
-- `--directory`, `-d`: Directory containing the OpenEnv environment (defaults to current directory)
-- `--repo-id`, `-r`: Repository ID in format 'username/repo-name' (defaults to 'username/env-name' from openenv.yaml)
-- `--base-image`, `-b`: Base Docker image to use (overrides Dockerfile FROM)
-- `--private`: Deploy the space as private (default: public)
-
-### Examples
+### Install & Run Locally
 
 ```bash
-# Push to your personal namespace (defaults to username/env-name from openenv.yaml)
-openenv push
+# Install dependencies
+uv sync
 
-# Push to a specific repository
-openenv push --repo-id my-org/my-env
-
-# Push with a custom base image
-openenv push --base-image ghcr.io/meta-pytorch/openenv-base:latest
-
-# Push as a private space
-openenv push --private
-
-# Combine options
-openenv push --repo-id my-org/my-env --base-image custom-base:latest --private
+# Start the server
+uvicorn server.app:app --reload --host 0.0.0.0 --port 8000
 ```
 
-After deployment, your space will be available at:
-`https://huggingface.co/spaces/<repo-id>`
-
-The deployed space includes:
-- **Web Interface** at `/web` - Interactive UI for exploring the environment
-- **API Documentation** at `/docs` - Full OpenAPI/Swagger interface
-- **Health Check** at `/health` - Container health monitoring
-- **WebSocket** at `/ws` - Persistent session endpoint for low-latency interactions
-
-## Environment Details
-
-### Action
-**AscAgentUnderDemandUncertainityRlAction**: Contains a single field
-- `message` (str) - The message to echo back
-
-### Observation
-**AscAgentUnderDemandUncertainityRlObservation**: Contains the echo response and metadata
-- `echoed_message` (str) - The message echoed back
-- `message_length` (int) - Length of the message
-- `reward` (float) - Reward based on message length (length × 0.1)
-- `done` (bool) - Always False for echo environment
-- `metadata` (dict) - Additional info like step count
-
-### Reward
-The reward is calculated as: `message_length × 0.1`
-- "Hi" → reward: 0.2
-- "Hello, World!" → reward: 1.3
-- Empty message → reward: 0.0
-
-## Advanced Usage
-
-### Connecting to an Existing Server
-
-If you already have a Asc Agent Under Demand Uncertainity Rl Env environment server running, you can connect directly:
-
-```python
-from asc_agent_under_demand_uncertainity_rl_env import AscAgentUnderDemandUncertainityRlEnv
-
-# Connect to existing server
-asc_agent_under_demand_uncertainity_rl_envenv = AscAgentUnderDemandUncertainityRlEnv(base_url="<ENV_HTTP_URL_HERE>")
-
-# Use as normal
-result = asc_agent_under_demand_uncertainity_rl_envenv.reset()
-result = asc_agent_under_demand_uncertainity_rl_envenv.step(AscAgentUnderDemandUncertainityRlAction(message="Hello!"))
-```
-
-Note: When connecting to an existing server, `asc_agent_under_demand_uncertainity_rl_envenv.close()` will NOT stop the server.
-
-### Using the Context Manager
-
-The client supports context manager usage for automatic connection management:
-
-```python
-from asc_agent_under_demand_uncertainity_rl_env import AscAgentUnderDemandUncertainityRlAction, AscAgentUnderDemandUncertainityRlEnv
-
-# Connect with context manager (auto-connects and closes)
-with AscAgentUnderDemandUncertainityRlEnv(base_url="http://localhost:8000") as env:
-    result = env.reset()
-    print(f"Reset: {result.observation.echoed_message}")
-    # Multiple steps with low latency
-    for msg in ["Hello", "World", "!"]:
-        result = env.step(AscAgentUnderDemandUncertainityRlAction(message=msg))
-        print(f"Echoed: {result.observation.echoed_message}")
-```
-
-The client uses WebSocket connections for:
-- **Lower latency**: No HTTP connection overhead per request
-- **Persistent session**: Server maintains your environment state
-- **Efficient for episodes**: Better for many sequential steps
-
-### Concurrent WebSocket Sessions
-
-The server supports multiple concurrent WebSocket connections. To enable this,
-modify `server/app.py` to use factory mode:
-
-```python
-# In server/app.py - use factory mode for concurrent sessions
-app = create_app(
-    AscAgentUnderDemandUncertainityRlEnvironment,  # Pass class, not instance
-    AscAgentUnderDemandUncertainityRlAction,
-    AscAgentUnderDemandUncertainityRlObservation,
-    max_concurrent_envs=4,  # Allow 4 concurrent sessions
-)
-```
-
-Then multiple clients can connect simultaneously:
-
-```python
-from asc_agent_under_demand_uncertainity_rl_env import AscAgentUnderDemandUncertainityRlAction, AscAgentUnderDemandUncertainityRlEnv
-from concurrent.futures import ThreadPoolExecutor
-
-def run_episode(client_id: int):
-    with AscAgentUnderDemandUncertainityRlEnv(base_url="http://localhost:8000") as env:
-        result = env.reset()
-        for i in range(10):
-            result = env.step(AscAgentUnderDemandUncertainityRlAction(message=f"Client {client_id}, step {i}"))
-        return client_id, result.observation.message_length
-
-# Run 4 episodes concurrently
-with ThreadPoolExecutor(max_workers=4) as executor:
-    results = list(executor.map(run_episode, range(4)))
-```
-
-## Development & Testing
-
-### Direct Environment Testing
-
-Test the environment logic directly without starting the HTTP server:
+### Build & Run with Docker
 
 ```bash
-# From the server directory
-python3 server/asc_agent_under_demand_uncertainity_rl_env_environment.py
+# Build
+docker build -t asc-supply-chain:latest -f Dockerfile .
+
+# Run
+docker run -p 8000:8000 asc-supply-chain:latest
 ```
 
-This verifies that:
-- Environment resets correctly
-- Step executes actions properly
-- State tracking works
-- Rewards are calculated correctly
-
-### Running Locally
-
-Run the server locally for development:
+### Run Baseline Inference (Gemini 2.0 Flash)
 
 ```bash
-uvicorn server.app:app --reload
+# Requires a free API key from https://aistudio.google.com
+export GEMINI_API_KEY=your_key
+
+# Start server first, then:
+python inference.py
 ```
+
+---
+
+## API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/reset` | POST | Reset environment (accepts `task`, `seed` params) |
+| `/step`  | POST | Execute an action |
+| `/state` | GET  | Current episode state |
+| `/schema`| GET  | Action / observation JSON schemas |
+| `/ws`    | WS   | Persistent WebSocket session (low latency) |
+| `/health`| GET  | Container health check |
+| `/docs`  | GET  | Interactive Swagger UI |
+| `/web`   | GET  | Web interface for manual exploration |
+
+---
 
 ## Project Structure
 
 ```
 asc_agent_under_demand_uncertainity_rl_env/
-├── .dockerignore         # Docker build exclusions
-├── __init__.py            # Module exports
-├── README.md              # This file
-├── openenv.yaml           # OpenEnv manifest
-├── pyproject.toml         # Project metadata and dependencies
-├── uv.lock                # Locked dependencies (generated)
-├── client.py              # AscAgentUnderDemandUncertainityRlEnv client
-├── models.py              # Action and Observation models
+├── Dockerfile          # Container image (at project root — hackathon requirement)
+├── openenv.yaml        # OpenEnv manifest with 3 task definitions
+├── pyproject.toml      # Project metadata and dependencies
+├── models.py           # SupplyChainAction, SupplyChainObservation, PendingOrder
+├── client.py           # Python client (WebSocket-based)
+├── graders.py          # Phase graders returning 0.0–1.0
+├── inference.py        # Gemini 2.0 Flash baseline agent
+├── __init__.py         # Package exports
 └── server/
-    ├── __init__.py        # Server module exports
-    ├── asc_agent_under_demand_uncertainity_rl_env_environment.py  # Core environment logic
-    ├── app.py             # FastAPI application (HTTP + WebSocket endpoints)
-    └── Dockerfile         # Container image definition
+    ├── app.py          # FastAPI application
+    └── asc_agent_under_demand_uncertainity_rl_env_environment.py  # Core simulation
 ```
+
+---
+
+## Deploying to Hugging Face Spaces
+
+```bash
+# Push to your namespace
+openenv push
+
+# Push to a specific repo
+openenv push --repo-id my-org/asc-supply-chain
+
+# Push as private
+openenv push --private
+```
+
+The deployed space includes a web UI at `/web` and full API docs at `/docs`.

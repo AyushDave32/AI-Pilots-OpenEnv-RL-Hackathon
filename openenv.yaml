@@ -5,3 +5,21 @@ runtime: fastapi
 app: server.app:app
 port: 8000
 
+tasks:
+  - id: easy_phase_inventory
+    name: "Easy Inventory Management"
+    description: "Manage warehouse inventory under stable demand conditions (~80 units/day, fixed 3-day lead time, low forecast noise)"
+    difficulty: easy
+    max_steps: 30
+
+  - id: medium_phase_inventory
+    name: "Medium Inventory Management"
+    description: "Manage warehouse inventory under seasonal demand with variable lead times (2–5 days, medium forecast noise)"
+    difficulty: medium
+    max_steps: 30
+
+  - id: hard_phase_inventory
+    name: "Hard Inventory Management"
+    description: "Manage warehouse inventory under volatile demand with random spikes and supply disruptions (2–10 day lead times, high noise)"
+    difficulty: hard
+    max_steps: 30
