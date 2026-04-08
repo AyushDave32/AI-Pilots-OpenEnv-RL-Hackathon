@@ -50,21 +50,16 @@ np.random.seed(42)
 EPISODE_SEED = 0
 
 # ── Hugging Face client (OpenAI-compatible Inference API) ────────────────────
-HF_TOKEN = os.environ.get("HF_TOKEN")
-if not HF_TOKEN:
-    sys.exit(
-        "Error: HF_TOKEN is not set.\n"
-        "Get a free token at https://huggingface.co/settings/tokens and run:\n"
-        "    export HF_TOKEN=hf_your_token_here"
-    )
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+if not GROQ_API_KEY:
+    sys.exit("Error: GROQ_API_KEY is not set.\nRun: export GROQ_API_KEY=your_key_here")
 
-# Default: Meta-Llama-3.1-8B-Instruct (free serverless tier on HF)
-# Override via:  export HF_MODEL=Qwen/Qwen2.5-7B-Instruct
-HF_MODEL = os.environ.get("HF_MODEL", "meta-llama/Meta-Llama-3.1-8B-Instruct")
+# Llama 3.1 8B on Groq (free, fast)
+HF_MODEL = os.environ.get("HF_MODEL", "llama-3.1-8b-instant")
 
 llm = openai.OpenAI(
-    api_key=HF_TOKEN,
-    base_url="https://api-inference.huggingface.co/v1/",
+    api_key=GROQ_API_KEY,
+    base_url="https://api.groq.com/openai/v1",
 )
 
 GRADERS = {
@@ -211,10 +206,10 @@ def main():
     print(f"  Model : {HF_MODEL}")
     print("═" * 70)
 
-    env = AscAgentUnderDemandUncertainityRlEnv(base_url="http://localhost:8000")
+    async_env = AscAgentUnderDemandUncertainityRlEnv(base_url="http://localhost:8001")
     scores: dict[str, float] = {}
 
-    with env:
+    with async_env.sync() as env:
         for difficulty in ("easy", "medium", "hard"):
             history = run_episode(env, difficulty)
             score   = GRADERS[difficulty](history)
