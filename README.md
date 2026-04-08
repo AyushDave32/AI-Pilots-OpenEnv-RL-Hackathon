@@ -193,18 +193,35 @@ docker build -t asc-supply-chain:latest -f Dockerfile .
 docker run -p 8000:8000 asc-supply-chain:latest
 ```
 
-### Run Baseline Inference (Hugging Face LLM)
+### Run Baseline Inference
 
 ```bash
-# Requires a free HF token from https://huggingface.co/settings/tokens
+# Required: Hugging Face API key (free at https://huggingface.co/settings/tokens)
 export HF_TOKEN=hf_your_token_here
 
-# Start server first, then:
-python inference.py
+# Optional overrides (defaults shown):
+export API_BASE_URL=https://router.huggingface.co/v1
+export MODEL_NAME=meta-llama/Llama-3.3-70B-Instruct
+export ENV_URL=http://localhost:8000  # override to use local server instead of HF Space
 
-# Override the model (default: meta-llama/Meta-Llama-3.1-8B-Instruct)
-HF_MODEL=Qwen/Qwen2.5-7B-Instruct python inference.py
+# Run:
+python inference.py
 ```
+
+---
+
+## Baseline Scores
+
+Baseline scores measured with `meta-llama/Llama-3.3-70B-Instruct` via HF router, `numpy seed=42`, `episode seed=0`:
+
+| Phase  | Service Score | Cost Score | Validity Score | **Final Score** |
+|--------|--------------|------------|----------------|-----------------|
+| Easy   | —            | —          | —              | **0.6334**      |
+| Medium | —            | —          | —              | **0.5152**      |
+| Hard   | —            | —          | —              | **0.5290**      |
+| **Overall** |         |            |                | **0.5592**      |
+
+Score formula: `0.5 × service_score + 0.3 × cost_score + 0.2 × validity_score`
 
 ---
 
@@ -233,7 +250,7 @@ asc_agent_under_demand_uncertainity_rl_env/
 ├── models.py           # SupplyChainAction, SupplyChainObservation, PendingOrder
 ├── client.py           # Python client (WebSocket-based)
 ├── graders.py          # Phase graders returning 0.0–1.0
-├── inference.py        # Gemini 2.0 Flash baseline agent
+├── inference.py        # Baseline agent (meta-llama/Llama-3.3-70B-Instruct via HF router)
 ├── __init__.py         # Package exports
 └── server/
     ├── app.py          # FastAPI application

@@ -71,3 +71,14 @@ class SupplyChainObservation(Observation):
     prompt: str = Field(
         ..., description="Natural language prompt for LLM-based agents"
     )
+
+    # Live grading fields (serialized directly — metadata is stripped by the framework)
+    phase_score: float = Field(
+        default=0.0, description="Live grader score for the current phase (0.0–1.0)"
+    )
+    actual_demand: float = Field(
+        default=0.0, description="Actual demand sampled this step (0 on reset)"
+    )
+    actual_fulfilled: float = Field(
+        default=0.0, description="Units actually fulfilled this step (0 on reset)"
+    )

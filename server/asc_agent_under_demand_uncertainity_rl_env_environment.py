@@ -421,6 +421,9 @@ class AscAgentUnderDemandUncertainityRlEnvironment(Environment):
             supplier_status=self._supplier_status,
             current_phase=self._phase,
             prompt=prompt,
+            phase_score=phase_score,
+            actual_demand=round(self._last_actual_demand, 2),
+            actual_fulfilled=round(self._last_actual_fulfilled, 2),
             reward=reward,
             done=self._done,
             metadata={
