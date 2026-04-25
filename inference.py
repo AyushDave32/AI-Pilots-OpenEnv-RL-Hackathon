@@ -101,21 +101,35 @@ def parse_action(content: str) -> tuple[SupplyChainAction, bool]:
     Extract a SupplyChainAction from the LLM's text response.
 
     Returns (action, is_valid). Falls back to hold on any parse failure.
-    LLM is prompted to output {"action": "order", "quantity": 100}.
+    LLM is prompted to output a 4-field JSON:
+      {"action_type": "order", "quantity": 100, "sell_price": 268.0,
+       "negotiation_message": "..."}
     """
     try:
-        match = re.search(r"\{[^{}]+\}", content, re.DOTALL)
+        # Match outermost JSON object (handles nested braces in negotiation_message)
+        match = re.search(r"\{.*\}", content, re.DOTALL)
         if not match:
             return SupplyChainAction(action_type="hold"), False
 
         data = json.loads(match.group())
-        action_type = data.get("action", data.get("action_type", "hold"))
-        quantity = data.get("quantity")
+        action_type = data.get("action_type", data.get("action", "hold"))
+        quantity    = data.get("quantity")
+        sell_price  = float(data.get("sell_price", 265.0))
+        neg_message = str(data.get("negotiation_message", ""))
 
         if action_type in ("order", "emergency_restock") and isinstance(quantity, (int, float)) and quantity > 0:
-            return SupplyChainAction(action_type=action_type, quantity=int(quantity)), True
+            return SupplyChainAction(
+                action_type=action_type,
+                quantity=int(quantity),
+                sell_price=sell_price,
+                negotiation_message=neg_message,
+            ), True
         elif action_type == "hold":
-            return SupplyChainAction(action_type="hold"), True
+            return SupplyChainAction(
+                action_type="hold",
+                sell_price=sell_price,
+                negotiation_message=neg_message,
+            ), True
         else:
             return SupplyChainAction(action_type="hold"), False
 
@@ -138,6 +152,8 @@ def run_episode(env: AscAgentUnderDemandUncertainityRlEnv, difficulty: str) -> f
 
     demand_history: List[float] = []
     fulfilled_history: List[float] = []
+    spoilage_history: List[float] = []
+    revenue_history: List[float] = []
     total_cost: float = 0.0
     valid_actions: int = 0
     total_actions: int = 0
@@ -161,11 +177,11 @@ def run_episode(env: AscAgentUnderDemandUncertainityRlEnv, difficulty: str) -> f
                     model=MODEL_NAME,
                     messages=[{"role": "user", "content": obs.prompt}],
                     temperature=0.0,
-                    max_tokens=64,
+                    max_tokens=400,   # large enough for 4-field JSON with negotiation message
                 )
                 llm_text = response.choices[0].message.content or ""
             except Exception as exc:
-                llm_text = '{"action": "hold"}'
+                llm_text = '{"action_type": "hold", "quantity": null, "sell_price": 265.0, "negotiation_message": ""}'
                 error = str(exc)[:120]
 
             action, is_valid = parse_action(llm_text)
@@ -173,24 +189,39 @@ def run_episode(env: AscAgentUnderDemandUncertainityRlEnv, difficulty: str) -> f
             if is_valid:
                 valid_actions += 1
 
+            # Cost tracking using new Rs formula (Rs 2000 fixed + Rs 200/unit)
             if action.action_type == "order" and action.quantity:
-                total_cost += 20 + action.quantity * 2
+                total_cost += 2000 + action.quantity * 200
             elif action.action_type == "emergency_restock" and action.quantity:
-                total_cost += 20 + action.quantity * 6
+                # Emergency surcharge depends on loyalty tier — use 4x (bronze worst case) for tracking
+                total_cost += 2000 + action.quantity * 200 * 4
 
             step_result = env.step(action)
             next_obs = step_result.observation
 
-            actual_demand    = next_obs.actual_demand if next_obs.actual_demand > 0 else obs.demand_forecast
-            actual_fulfilled = next_obs.actual_fulfilled
+            # Read actuals from observation metadata (set by environment step)
+            meta           = next_obs.metadata or {}
+            actual_demand    = float(meta.get("actual_demand",    next_obs.demand_forecast))
+            actual_fulfilled = float(meta.get("units_fulfilled",  0.0))
+            units_spoiled    = float(meta.get("units_spoiled",    0.0))
+            gross_profit     = float(meta.get("reward_components", {}).get("gross_profit", 0.0))
 
             demand_history.append(actual_demand)
             fulfilled_history.append(actual_fulfilled)
+            spoilage_history.append(units_spoiled)
+            revenue_history.append(gross_profit)
             rewards.append(step_result.reward)
             steps_taken = step
 
             action_str = json.dumps(
-                {"action": action.action_type, "quantity": action.quantity},
+                {
+                    "action_type": action.action_type,
+                    "quantity": action.quantity,
+                    "sell_price": action.sell_price,
+                    "negotiation_message": action.negotiation_message[:60] + "..."
+                    if len(action.negotiation_message) > 60
+                    else action.negotiation_message,
+                },
                 separators=(",", ":"),
             )
             log_step(step=step, action=action_str, reward=step_result.reward, done=step_result.done, error=error)
@@ -202,6 +233,8 @@ def run_episode(env: AscAgentUnderDemandUncertainityRlEnv, difficulty: str) -> f
             phase=difficulty,
             demand_history=demand_history,
             fulfilled_history=fulfilled_history,
+            spoilage_history=spoilage_history,
+            revenue_history=revenue_history,
             total_cost=total_cost,
             valid_actions=valid_actions,
             total_actions=total_actions,

@@ -5,382 +5,555 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-Adaptive Supply Chain RL Environment — Curriculum Wrapper (Approach C).
+PharmaNegotiate Supply Chain RL Environment.
 
-A single environment that runs a 30-day episode through 3 difficulty phases
-(easy → medium → hard). Difficulty auto-promotes when the agent's rolling
-7-day service level exceeds 90% for 7+ consecutive days in a phase.
+Simulates MediStock Pvt. Ltd. managing perishable surgical gloves inventory
+over a 30-day episode. The agent must:
+  1. Buy-side decisions — order type, quantity, timing (FEFO, expiry-aware)
+  2. Sell-side decisions — set daily sell price via price elasticity
+  3. Relationship management — write daily supplier negotiation messages
+  4. World modeling — infer supplier's hidden loyalty tier from observable signals
 
-Phase specs:
-  Easy   — stable ~80/day demand, fixed 3-day lead time, ±10% forecast noise
-  Medium — seasonal wave (peak day 15), 2–5 day random lead time, ±25% noise
-  Hard   — random spikes + baseline, 2–10 day lead time + delays, ±40% noise
-
-Reward (per step):
-  + fulfilled_units × 3.0          (sell at $3/unit — $1 margin over $2 unit cost)
-  − 50.0  if stockout occurred
-  − 0.5 × max(0, stock − 200)      (overstock penalty)
-  − (20 + qty × 2) for order
-  − (20 + qty × 6) for emergency_restock
-  + 5.0   if stock in [50, 200]    (efficiency bonus)
-  − 10.0  if action was malformed
+The supplier (GloveMaker Industries) maintains hidden state (loyalty tier,
+supplier mood, order regularity) that drives costs and crisis allocation.
+On days 21–25 a factory fire reduces capacity to 30% — only loyal customers
+get full allocation.
 """
 
-from uuid import uuid4
+import math
+import uuid
+from typing import List
 
 import numpy as np
-from pydantic import ValidationError
-
 from openenv.core.env_server.interfaces import Environment
 from openenv.core.env_server.types import State
 
 try:
-    from ..models import PendingOrder, SupplyChainAction, SupplyChainObservation
+    from ..models import PendingOrder, StockBatch, SupplyChainAction, SupplyChainObservation
 except (ImportError, ModuleNotFoundError):
-    from models import PendingOrder, SupplyChainAction, SupplyChainObservation
+    from models import PendingOrder, StockBatch, SupplyChainAction, SupplyChainObservation
+
+# ---------------------------------------------------------------------------
+# Module-level constants
+# ---------------------------------------------------------------------------
+
+SHELF_LIFE_DAYS = 15
+UNIT_COST_STANDARD = 200
+FIXED_ORDER_COST = 2000
+STOCKOUT_PENALTY = 50.0
+SPOILAGE_PENALTY_PER_UNIT = 20.0
+OVERSTOCK_THRESHOLD = 300
+OPTIMAL_STOCK_RANGE = (50, 300)
+PRICE_ELASTICITY = 1.5
+NEG_EPISODE_CAP = 30.0
+CRISIS_DAYS = set(range(21, 26))
+
+MARKET_PRICE = {"easy": 265.0, "medium": 285.0, "hard": 310.0}
+BASE_DEMAND = {"easy": 80.0, "medium": 100.0, "hard": 90.0}
+
+SURCHARGE = {"gold": 2.5, "silver": 3.0, "bronze": 4.0}
+LEAD_MODIFIER = {"gold": -1, "silver": 0, "bronze": 2}
+CRISIS_FILL = {"gold": 1.0, "silver": 0.8, "bronze": 0.5}
+
+SUPPLIER_MESSAGES = {
+    "gold": "Your order of {qty} units is confirmed and prioritised — delivery in {lt} days.",
+    "silver": "Order received. Expected delivery in {lt} days.",
+    "bronze": "We'll process your order. Lead times may extend to {lt} days.",
+    "bronze_crisis": "We regret we can only fulfil {actual} of your {qty} units at this time.",
+    "gold_discount": "As a valued partner, we are offering a 5% discount on this order.",
+    "no_order": "No order placed today. We look forward to your next order.",
+}
+
+RUBRIC_CHECKS_NEEDED = {"easy": 1, "medium": 2, "hard": 3}
 
 
 class AscAgentUnderDemandUncertainityRlEnvironment(Environment):
     """
-    Adaptive Supply Chain RL Environment with curriculum difficulty progression.
+    PharmaNegotiate Supply Chain RL Environment.
 
-    The agent acts as a warehouse manager placing daily inventory orders over a
-    30-day episode. Demand is uncertain, lead times vary, and performance is
-    measured by service level (fulfilled / total demand).
+    The agent manages perishable pharmaceutical inventory with:
+    - FEFO (First Expired First Out) batch-level inventory tracking
+    - Sell-side price elasticity (agent sets daily hospital sell price)
+    - Supplier hidden state (loyalty tier: bronze/silver/gold)
+    - LLM-native negotiation action (scored by rubric, drives loyalty)
+    - Day 21–25 factory crisis (capacity 30%; tier determines allocation)
 
     Episode flow:
-        reset() → step() × 30 → done=True
-
-    Phases promote when service_level > 90% for 7+ consecutive days:
-        easy → medium → hard
+        reset() → step() × 30 → done=True (day > 30)
     """
 
     SUPPORTS_CONCURRENT_SESSIONS: bool = True
 
-    # ------------------------------------------------------------------ #
-    # Cost / penalty / reward constants (fixed across all phases)          #
-    # ------------------------------------------------------------------ #
-    FULFILLMENT_REWARD_PER_UNIT = 3.0   # sells at $3/unit, buys at $2/unit → $1 margin incentivises ordering
-    ORDER_FIXED_COST = 20.0
-    ORDER_UNIT_COST = 2.0
-    EMERGENCY_FIXED_COST = 20.0
-    EMERGENCY_UNIT_COST = 6.0
-    HOLDING_COST_PER_UNIT = 0.5
-    STOCKOUT_PENALTY = 50.0
-    OVERSTOCK_PENALTY_PER_UNIT = 0.5
-    OVERSTOCK_THRESHOLD = 200
-    EFFICIENCY_BONUS = 5.0
-    EFFICIENCY_MIN = 50
-    EFFICIENCY_MAX = 200
-    MALFORMED_PENALTY = 10.0
-
-    # Phase grading constants (mirrored from graders.py for live metadata)
-    _PHASE_TARGET_SL = {"easy": 0.95, "medium": 0.85, "hard": 0.75}
-    _PHASE_MAX_COST  = {"easy": 800.0, "medium": 1200.0, "hard": 1500.0}
-
     def __init__(self):
-        self._episode_id: str = str(uuid4())
+        self._episode_id: str = str(uuid.uuid4())
         self._day: int = 1
         self._done: bool = False
         self._rng: np.random.Generator = np.random.default_rng()
 
-        # Inventory state
-        self._stock: int = 200
-        self._budget: float = 1000.0
-        self._pending_orders: list[PendingOrder] = []
+        self._forced_phase = None
+        self._stock_batches: List[StockBatch] = []
+        self._pending_orders: List[PendingOrder] = []
+        self._budget: float = 10000.0
 
-        # Episode-level history (full 30 days)
-        self._demand_history: list[float] = []
-        self._fulfilled_history: list[float] = []
+        self._demand_history: List[float] = []
+        self._fulfilled_history: List[float] = []
+        self._neg_score_history: List[float] = []
 
-        # Curriculum state
-        self._phase: str = "easy"
-        self._days_in_phase: int = 0
+        self._neg_bonus_total: float = 0.0
+        self._last_sell_price: float = MARKET_PRICE["easy"]
         self._last_7_day_service_level: float = 1.0
-        self._supplier_status: str = "normal"
 
-        # Phase-level tracking for live grader score in metadata
-        self._phase_demand: list[float] = []
-        self._phase_fulfilled: list[float] = []
+        # Supplier hidden state — never exposed directly in observation
+        self._loyalty_tier: str = "gold"
+        self._supplier_mood: float = 0.8
+        self._order_regularity: float = 0.5
+        self._trust_score: float = 0.8
+        self._consecutive_holds: int = 0
+        self._last_lead_promised: int = 3
+        self._supplier_neg_threshold_bonus: float = 0.0
+
+        # Last-step observable supplier signals (built in step, read in _build_observation)
+        self._supplier_last_message: str = ""
+        self._lead_time_accuracy: str = "on time"
+        self._proactive_discount: bool = False
+        self._last_units_spoiled: int = 0
+
+        # Phase tracking for live grading
+        self._phase_demand: List[float] = []
+        self._phase_fulfilled: List[float] = []
+        self._phase_spoilage: List[float] = []
+        self._phase_revenue: List[float] = []
         self._phase_total_cost: float = 0.0
         self._phase_valid_actions: int = 0
         self._phase_total_actions: int = 0
 
-        # Last step actuals for metadata exposure
-        self._last_actual_demand: float = 0.0
-        self._last_actual_fulfilled: float = 0.0
+    # -----------------------------------------------------------------------
+    # Environment interface
+    # -----------------------------------------------------------------------
 
-    # ------------------------------------------------------------------ #
-    # Environment interface                                                 #
-    # ------------------------------------------------------------------ #
+    def reset(self, seed=None, task=None, **kwargs) -> SupplyChainObservation:
+        """Reset the environment for a new episode."""
+        task_to_phase = {
+            "easy_phase_inventory": "easy",
+            "medium_phase_inventory": "medium",
+            "hard_phase_inventory": "hard",
+        }
+        self._forced_phase = task_to_phase.get(task) if task else None
 
-    def reset(self, seed: int | None = None, task: str | None = None, **kwargs) -> SupplyChainObservation:
-        """
-        Reset the environment for a new episode.
-
-        Args:
-            seed: Optional RNG seed for reproducibility.
-            task: Optional starting phase. Accepted:
-                  "easy" | "easy_phase_inventory"
-                  "medium" | "medium_phase_inventory"
-                  "hard"  | "hard_phase_inventory"
-                  Defaults to "easy" (full curriculum).
-        """
-        if seed is not None:
-            self._rng = np.random.default_rng(seed)
-        else:
-            self._rng = np.random.default_rng()
-
-        self._episode_id = str(uuid4())
+        self._rng = np.random.default_rng(seed)
         self._day = 1
+        self._budget = 10000.0
+        self._episode_id = str(uuid.uuid4())
         self._done = False
 
-        # Randomize starting stock: uniform [150, 300]
-        self._stock = int(self._rng.integers(150, 301))
-        self._budget = 1000.0
+        self._stock_batches = []
         self._pending_orders = []
         self._demand_history = []
         self._fulfilled_history = []
+        self._neg_score_history = []
+
+        self._neg_bonus_total = 0.0
+        self._last_sell_price = MARKET_PRICE["easy"]
         self._last_7_day_service_level = 1.0
-        self._supplier_status = "normal"
-        self._last_actual_demand = 0.0
-        self._last_actual_fulfilled = 0.0
 
-        # Starting phase
-        if task in ("medium", "medium_phase_inventory"):
-            self._phase = "medium"
-        elif task in ("hard", "hard_phase_inventory"):
-            self._phase = "hard"
-        else:
-            self._phase = "easy"
+        # Supplier hidden state
+        self._loyalty_tier = "gold"
+        self._supplier_mood = 0.8
+        self._order_regularity = 0.5
+        self._trust_score = 0.8
+        self._consecutive_holds = 0
+        self._last_lead_promised = 3
+        self._supplier_neg_threshold_bonus = 0.0
 
-        self._days_in_phase = 0
-        self._reset_phase_trackers()
+        # Observable supplier signals reset
+        self._supplier_last_message = "Welcome, MediStock. We look forward to a productive partnership."
+        self._lead_time_accuracy = "on time"
+        self._proactive_discount = False
+        self._last_units_spoiled = 0
 
-        return self._make_observation(reward=0.0)
+        # Phase trackers
+        self._phase_demand = []
+        self._phase_fulfilled = []
+        self._phase_spoilage = []
+        self._phase_revenue = []
+        self._phase_total_cost = 0.0
+        self._phase_valid_actions = 0
+        self._phase_total_actions = 0
+
+        # Initial stock — expires day 16 to create urgency entering medium phase
+        init_qty = int(self._rng.integers(150, 301))
+        self._stock_batches.append(
+            StockBatch(quantity=init_qty, expires_on_day=16, arrived_on_day=0)
+        )
+
+        return self._build_observation(reward=0.0)
 
     def step(self, action: SupplyChainAction) -> SupplyChainObservation:
-        """
-        Execute one day in the supply chain simulation.
+        """Execute one day in the PharmaNegotiate simulation."""
 
-        Steps:
-          1.  Validate action  (−10 for malformed, treat as hold)
-          2.  Process pending order arrivals
-          3.  Place order / emergency restock; deduct cost
-          4.  Sample actual demand (phase-dependent noise)
-          5.  Fulfill demand: fulfilled = min(stock, demand)
-          6.  Update stock; record stockout
-          7.  Compute multi-component step reward
-          8.  Append to demand/fulfilled history (episode + phase)
-          9.  Recompute last_7_day_service_level
-          10. Check phase promotion (days_in_phase ≥ 7 AND sl > 0.90)
-          11. Increment day; done = (day > 30)
-          12. Return SupplyChainObservation
-        """
+        # STEP 1 — Guard
         if self._done:
             raise RuntimeError("Episode is done. Call reset() first.")
 
-        # 1. Validate action
-        action_malformed = False
-        try:
-            if action.action_type in ("order", "emergency_restock"):
-                if action.quantity is None or action.quantity <= 0:
-                    action_malformed = True
-                    action = SupplyChainAction(action_type="hold")
-        except (ValidationError, Exception):
-            action_malformed = True
-            action = SupplyChainAction(action_type="hold")
+        # STEP 2 — Validate action
+        malformed = False
+        reward = 0.0
+
+        phase = self._current_phase()
+
+        if action.action_type in ("order", "emergency_restock"):
+            if action.quantity is None or action.quantity <= 0:
+                malformed = True
+                reward -= 10.0
+                action = SupplyChainAction(
+                    action_type="hold",
+                    quantity=None,
+                    sell_price=action.sell_price if action.sell_price and action.sell_price > 0 else MARKET_PRICE[phase],
+                    negotiation_message=action.negotiation_message,
+                )
+
+        if action.sell_price is None or action.sell_price <= 0:
+            malformed = True
+            reward -= 10.0
+            action = SupplyChainAction(
+                action_type=action.action_type,
+                quantity=action.quantity,
+                sell_price=MARKET_PRICE[phase],
+                negotiation_message=action.negotiation_message,
+            )
 
         self._phase_total_actions += 1
-        if not action_malformed:
+        if not malformed:
             self._phase_valid_actions += 1
 
-        reward = 0.0
-        if action_malformed:
-            reward -= self.MALFORMED_PENALTY
+        # STEP 3 — Determine phase and crisis state
+        crisis_active = self._day in CRISIS_DAYS
 
-        # 2. Process pending order arrivals
-        arrived = 0
-        remaining_orders: list[PendingOrder] = []
-        for po in self._pending_orders:
-            new_eta = po.arrives_in_days - 1
-            if new_eta <= 0:
-                arrived += po.quantity
-            else:
-                remaining_orders.append(PendingOrder(quantity=po.quantity, arrives_in_days=new_eta))
-        self._stock += arrived
-        self._pending_orders = remaining_orders
+        # At phase boundaries, reset loyalty tier to phase default
+        if self._day == 8 and not self._forced_phase:
+            self._loyalty_tier = "silver"
+        if self._day == 16 and not self._forced_phase:
+            self._loyalty_tier = "bronze"
 
-        # 3. Place order / emergency restock
-        order_cost = 0.0
-        if action.action_type == "order" and not action_malformed:
-            order_cost = self.ORDER_FIXED_COST + action.quantity * self.ORDER_UNIT_COST
-            self._budget -= order_cost
-            reward -= order_cost
-            self._phase_total_cost += order_cost
-            lead_time = self._sample_lead_time()
-            self._pending_orders.append(
-                PendingOrder(quantity=action.quantity, arrives_in_days=lead_time)
+        # STEP 4 — Spoilage check (BEFORE arrivals and demand)
+        expired = [b for b in self._stock_batches if b.expires_on_day <= self._day]
+        units_spoiled = sum(b.quantity for b in expired)
+        self._stock_batches = [b for b in self._stock_batches if b.expires_on_day > self._day]
+        reward -= SPOILAGE_PENALTY_PER_UNIT * units_spoiled
+        self._last_units_spoiled = units_spoiled
+
+        # STEP 5 — Process pending order arrivals
+        still_pending = []
+        for order in self._pending_orders:
+            order = PendingOrder(
+                quantity=order.quantity,
+                arrives_in_days=order.arrives_in_days - 1,
             )
-        elif action.action_type == "emergency_restock" and not action_malformed:
-            order_cost = self.EMERGENCY_FIXED_COST + action.quantity * self.EMERGENCY_UNIT_COST
-            self._budget -= order_cost
+            if order.arrives_in_days <= 0:
+                new_batch = StockBatch(
+                    quantity=order.quantity,
+                    expires_on_day=self._day + SHELF_LIFE_DAYS,
+                    arrived_on_day=self._day,
+                )
+                self._stock_batches.append(new_batch)
+            else:
+                still_pending.append(order)
+        self._pending_orders = still_pending
+
+        # STEP 6 — Compute loyalty tier from hidden state
+        if self._order_regularity > 0.70 and self._trust_score > 0.75:
+            self._loyalty_tier = "gold"
+        elif self._order_regularity > 0.40 or self._trust_score > 0.50:
+            self._loyalty_tier = "silver"
+        else:
+            self._loyalty_tier = "bronze"
+
+        # Adaptive difficulty: agent performing well → supplier raises bar
+        if self._last_7_day_service_level > 0.85 and self._day > 7:
+            self._supplier_neg_threshold_bonus = min(
+                0.15, self._supplier_neg_threshold_bonus + 0.01
+            )
+
+        # STEP 7 — Process agent's order
+        my_actual = 0
+        order_cost = 0.0
+        lead_time_promised = 0
+
+        if action.action_type == "order":
+            base_lt_map = {
+                "easy": 3,
+                "medium": int(self._rng.integers(2, 6)),
+                "hard": int(self._rng.integers(2, 11)),
+            }
+            base_lt = base_lt_map[phase]
+            lead_time_promised = max(1, base_lt + LEAD_MODIFIER[self._loyalty_tier])
+            my_actual = action.quantity
+            order_cost = FIXED_ORDER_COST + my_actual * UNIT_COST_STANDARD
             reward -= order_cost
+            self._budget -= order_cost
             self._phase_total_cost += order_cost
-            self._stock += action.quantity  # arrives immediately
+            self._consecutive_holds = 0
+            self._order_regularity = min(1.0, self._order_regularity + 0.03)
 
-        # 4. Sample actual demand
-        demand = self._sample_demand()
+        elif action.action_type == "emergency_restock":
+            surcharge_rate = SURCHARGE[self._loyalty_tier]
+            lead_time_promised = 1
+            my_actual = action.quantity
+            order_cost = FIXED_ORDER_COST + my_actual * UNIT_COST_STANDARD * surcharge_rate
+            reward -= order_cost
+            self._budget -= order_cost
+            self._phase_total_cost += order_cost
+            self._consecutive_holds = 0
+            self._order_regularity = max(0.0, self._order_regularity - 0.05)
 
-        # 5. Fulfill demand
-        fulfilled = float(min(self._stock, demand))
+        else:  # hold
+            self._consecutive_holds += 1
+            if self._consecutive_holds >= 3:
+                self._order_regularity = max(0.0, self._order_regularity - 0.02)
 
-        # 6. Update stock; track stockout
-        stockout_occurred = demand > self._stock
-        self._stock = max(0, self._stock - int(np.ceil(demand)))
+        if self._budget < 0:
+            reward -= 100.0
+            self._order_regularity = max(0.0, self._order_regularity - 0.10)
 
-        # 7. Compute reward components
-        # Core signal: reward fulfilling demand (prevents hold-only degenerate policy)
-        reward += fulfilled * self.FULFILLMENT_REWARD_PER_UNIT
+        # STEP 8 — Apply crisis allocation
+        requested_qty = my_actual
+        if crisis_active and my_actual > 0:
+            fill_rate = CRISIS_FILL[self._loyalty_tier]
+            my_actual = int(my_actual * fill_rate)
 
+        # STEP 9 — Add order to pending with loyalty-adjusted lead time
+        if my_actual > 0:
+            if self._loyalty_tier == "bronze":
+                lt_actual = lead_time_promised + int(self._rng.integers(0, 3))
+            else:
+                lt_actual = lead_time_promised
+            self._last_lead_promised = lead_time_promised
+            self._pending_orders.append(
+                PendingOrder(quantity=my_actual, arrives_in_days=lt_actual)
+            )
+
+        # STEP 10 — Sample actual demand with price elasticity
+        base = BASE_DEMAND[phase]
+        market_price = MARKET_PRICE[phase]
+        noise_pct = {"easy": 0.10, "medium": 0.25, "hard": 0.40}[phase]
+        noise = self._rng.uniform(-noise_pct, noise_pct)
+
+        if phase == "medium":
+            seasonal = 1.0 + 0.3 * math.sin(math.pi * (self._day - 8) / 7)
+            base *= seasonal
+
+        if phase == "hard" and self._rng.random() < 0.2:
+            base *= float(self._rng.uniform(1.5, 2.5))
+
+        sell_price = max(action.sell_price, 1.0)
+        price_ratio = market_price / sell_price
+        demand_factor = price_ratio ** PRICE_ELASTICITY
+
+        if self._supplier_neg_threshold_bonus > 0.05:
+            demand_factor *= float(self._rng.uniform(0.9, 1.1))
+
+        actual_demand = max(0, int(base * (1 + noise) * demand_factor))
+
+        # STEP 11 — Fulfill demand using FEFO (First Expired First Out)
+        remaining_demand = actual_demand
+        for batch in sorted(self._stock_batches, key=lambda b: b.expires_on_day):
+            if remaining_demand <= 0:
+                break
+            take = min(batch.quantity, remaining_demand)
+            batch.quantity -= take
+            remaining_demand -= take
+        self._stock_batches = [b for b in self._stock_batches if b.quantity > 0]
+
+        units_fulfilled = actual_demand - remaining_demand
+        stockout_occurred = remaining_demand > 0
+        current_stock = sum(b.quantity for b in self._stock_batches)
+
+        # STEP 12 — Sell-side profit and penalties
+        gross_profit = (sell_price - UNIT_COST_STANDARD) * units_fulfilled
+        reward += gross_profit
         if stockout_occurred:
-            reward -= self.STOCKOUT_PENALTY
+            reward -= STOCKOUT_PENALTY
+        excess = max(0, current_stock - OVERSTOCK_THRESHOLD)
+        reward -= 0.5 * excess
+        if OPTIMAL_STOCK_RANGE[0] <= current_stock <= OPTIMAL_STOCK_RANGE[1]:
+            reward += 5.0
 
-        excess = max(0, self._stock - self.OVERSTOCK_THRESHOLD)
-        reward -= self.OVERSTOCK_PENALTY_PER_UNIT * excess
+        # STEP 13 — Sell price regularity effect on order_regularity
+        price_deviation = abs(sell_price - market_price) / market_price
+        if price_deviation <= 0.20:
+            self._order_regularity = min(1.0, self._order_regularity + 0.01)
 
-        if self.EFFICIENCY_MIN <= self._stock <= self.EFFICIENCY_MAX:
-            reward += self.EFFICIENCY_BONUS
+        # STEP 14 — Negotiation scoring
+        try:
+            try:
+                from negotiation_rubric import score_negotiation
+            except ImportError:
+                from ..negotiation_rubric import score_negotiation  # type: ignore
+            checks_needed = RUBRIC_CHECKS_NEEDED[phase]
+            neg_result = score_negotiation(
+                message=action.negotiation_message,
+                state=self._get_state_dict(),
+                phase=phase,
+                checks_needed=checks_needed,
+                adaptive_bonus=self._supplier_neg_threshold_bonus,
+            )
+            neg_score = neg_result["total_score"]
+        except Exception:
+            neg_score = 0.0
 
-        # 8. Append history
-        self._demand_history.append(demand)
-        self._fulfilled_history.append(fulfilled)
-        self._phase_demand.append(demand)
-        self._phase_fulfilled.append(fulfilled)
-        self._last_actual_demand = demand
-        self._last_actual_fulfilled = fulfilled
+        neg_bonus = min(neg_score * 10.0, max(0.0, NEG_EPISODE_CAP - self._neg_bonus_total))
+        self._neg_bonus_total += neg_bonus
+        reward += neg_bonus
 
-        # 9. Recompute 7-day service level
-        last7_demand = sum(self._demand_history[-7:])
-        last7_fulfilled = sum(self._fulfilled_history[-7:])
-        self._last_7_day_service_level = (
-            last7_fulfilled / last7_demand if last7_demand > 0 else 1.0
-        )
+        if neg_score >= (RUBRIC_CHECKS_NEEDED[phase] / 3):
+            self._trust_score = min(1.0, self._trust_score + 0.03)
+            self._order_regularity = min(1.0, self._order_regularity + 0.01)
+        else:
+            self._trust_score = max(0.0, self._trust_score - 0.01)
 
-        # 10. Phase promotion (days_in_phase increments after history update)
-        self._days_in_phase += 1
-        if self._days_in_phase >= 7 and self._last_7_day_service_level > 0.90:
-            if self._phase == "easy":
-                self._phase = "medium"
-                self._days_in_phase = 0
-                self._reset_phase_trackers()
-            elif self._phase == "medium":
-                self._phase = "hard"
-                self._days_in_phase = 0
-                self._reset_phase_trackers()
-            # hard → no further promotion
+        self._neg_score_history.append(neg_score)
 
-        # Update supplier status
-        self._supplier_status = self._sample_supplier_status()
+        # STEP 15 — Generate supplier response message
+        proactive_discount = False
+        if crisis_active and self._loyalty_tier == "bronze" and my_actual < requested_qty:
+            supplier_msg = SUPPLIER_MESSAGES["bronze_crisis"].format(
+                actual=my_actual, qty=requested_qty
+            )
+        elif self._loyalty_tier == "gold" and my_actual > 0 and self._rng.random() < 0.25:
+            supplier_msg = SUPPLIER_MESSAGES["gold_discount"]
+            proactive_discount = True
+        elif my_actual > 0:
+            template = SUPPLIER_MESSAGES[self._loyalty_tier]
+            supplier_msg = template.format(qty=my_actual, lt=self._last_lead_promised)
+        else:
+            supplier_msg = SUPPLIER_MESSAGES["no_order"]
 
-        # 11. Increment day; check done
+        # Lead time accuracy signal based on loyalty tier
+        if self._loyalty_tier == "gold":
+            lead_time_accuracy = "on time"
+        elif self._loyalty_tier == "silver":
+            lead_time_accuracy = "on time" if self._rng.random() > 0.15 else "1 day late"
+        else:
+            days_late = int(self._rng.integers(0, 3))
+            lead_time_accuracy = "on time" if days_late == 0 else f"{days_late} day(s) late"
+
+        self._supplier_last_message = supplier_msg
+        self._lead_time_accuracy = lead_time_accuracy
+        self._proactive_discount = proactive_discount
+
+        # STEP 16 — Update histories and rolling service level
+        self._demand_history.append(float(actual_demand))
+        self._fulfilled_history.append(float(units_fulfilled))
+        self._last_sell_price = action.sell_price
+
+        self._phase_demand.append(float(actual_demand))
+        self._phase_fulfilled.append(float(units_fulfilled))
+        self._phase_spoilage.append(float(units_spoiled))
+        self._phase_revenue.append(float(gross_profit))
+
+        d7 = self._demand_history[-7:]
+        f7 = self._fulfilled_history[-7:]
+        self._last_7_day_service_level = sum(f7) / max(sum(d7), 1)
+
+        # STEP 17 — Compute expiry info for observation (handled in _build_observation)
+
+        # STEP 18 — Increment day and check done
         self._day += 1
         self._done = self._day > 30
 
-        return self._make_observation(reward=reward)
+        # STEP 19 — Build metadata and return observation
+        metadata = {
+            "actual_demand": actual_demand,
+            "units_fulfilled": units_fulfilled,
+            "units_spoiled": units_spoiled,
+            "stockout_occurred": stockout_occurred,
+            "neg_score": neg_score,
+            "neg_bonus": neg_bonus,
+            "crisis_active": crisis_active,
+            "loyalty_tier": self._loyalty_tier,
+            "action_malformed": malformed,
+            "phase_score": 0.0,
+            "reward_components": {
+                "gross_profit": gross_profit,
+                "spoilage_penalty": -SPOILAGE_PENALTY_PER_UNIT * units_spoiled,
+                "stockout_penalty": -STOCKOUT_PENALTY if stockout_occurred else 0.0,
+                "overstock_penalty": -0.5 * excess,
+                "order_cost": -order_cost,
+                "efficiency_bonus": (
+                    5.0 if OPTIMAL_STOCK_RANGE[0] <= current_stock <= OPTIMAL_STOCK_RANGE[1] else 0.0
+                ),
+                "negotiation_bonus": neg_bonus,
+            },
+        }
+        return self._build_observation(reward=reward, metadata=metadata)
 
     @property
     def state(self) -> State:
         return State(episode_id=self._episode_id, step_count=self._day)
 
-    # ------------------------------------------------------------------ #
-    # Phase tracking helpers                                               #
-    # ------------------------------------------------------------------ #
+    # -----------------------------------------------------------------------
+    # Helpers
+    # -----------------------------------------------------------------------
 
-    def _reset_phase_trackers(self) -> None:
-        """Reset per-phase grading accumulators on phase transition."""
-        self._phase_demand = []
-        self._phase_fulfilled = []
-        self._phase_total_cost = 0.0
-        self._phase_valid_actions = 0
-        self._phase_total_actions = 0
+    def _current_phase(self) -> str:
+        if self._forced_phase:
+            return self._forced_phase
+        if self._day <= 7:
+            return "easy"
+        elif self._day <= 15:
+            return "medium"
+        return "hard"
+
+    def _get_state_dict(self) -> dict:
+        return {
+            "day": self._day,
+            "phase": self._current_phase(),
+            "trust_score": self._trust_score,
+            "crisis_active": self._day in CRISIS_DAYS,
+            "current_stock": sum(b.quantity for b in self._stock_batches),
+            "budget_remaining": self._budget,
+        }
 
     def _compute_phase_score(self) -> float:
-        """Compute live grader score for the current phase (0.0–1.0)."""
-        target = self._PHASE_TARGET_SL[self._phase]
-        max_cost = self._PHASE_MAX_COST[self._phase]
-
-        total_demand = sum(self._phase_demand)
+        target = {"easy": 0.95, "medium": 0.85, "hard": 0.75}[self._current_phase()]
+        max_cost = {"easy": 15000.0, "medium": 25000.0, "hard": 30000.0}[self._current_phase()]
+        total_demand = max(sum(self._phase_demand), 1.0)
         total_fulfilled = sum(self._phase_fulfilled)
-
-        avg_sl = total_fulfilled / max(total_demand, 1.0)
-        service_score = min(avg_sl / target, 1.0)
-        cost_score = max(0.0, 1.0 - (self._phase_total_cost / max_cost))
+        service_score = min(total_fulfilled / total_demand / target, 1.0)
+        cost_score = max(0.0, 1.0 - self._phase_total_cost / max_cost)
         validity_score = self._phase_valid_actions / max(self._phase_total_actions, 1)
-
         return round(0.5 * service_score + 0.3 * cost_score + 0.2 * validity_score, 4)
 
-    # ------------------------------------------------------------------ #
-    # Phase-dependent simulation helpers                                   #
-    # ------------------------------------------------------------------ #
+    def _build_observation(self, reward: float, metadata: dict = None) -> SupplyChainObservation:
+        phase = self._current_phase()
+        market_price = MARKET_PRICE[phase]
+        current_stock = sum(b.quantity for b in self._stock_batches)
+        crisis_active = (self._day - 1) in CRISIS_DAYS  # use previous day since day already incremented in step
 
-    def _sample_demand(self) -> float:
-        """Sample actual demand based on current phase."""
-        if self._phase == "easy":
-            base = 80.0
-            noise = self._rng.uniform(-base * 0.10, base * 0.10)
-            return max(0.0, base + noise)
-
-        elif self._phase == "medium":
-            # Seasonal wave peaking around day 15 of the phase
-            peak_offset = np.pi * self._days_in_phase / 14.0
-            base = 80.0 + 40.0 * np.sin(peak_offset)
-            noise = self._rng.uniform(-base * 0.25, base * 0.25)
-            return max(0.0, base + noise)
-
-        else:  # hard
-            base = 80.0
-            if self._rng.random() < 0.20:  # random spike ~20% of days
-                base += float(self._rng.uniform(100.0, 200.0))
-            noise = self._rng.uniform(-base * 0.40, base * 0.40)
-            return max(0.0, base + noise)
-
-    def _sample_lead_time(self) -> int:
-        """Sample supplier lead time based on current phase."""
-        if self._phase == "easy":
-            return 3
-        elif self._phase == "medium":
-            return int(self._rng.integers(2, 6))  # 2–5 days
-        else:  # hard
-            base = int(self._rng.integers(2, 11))  # 2–10 days
-            if self._rng.random() < 0.20:
-                base += int(self._rng.integers(1, 5))  # additional random delay
-            return base
-
-    def _sample_supplier_status(self) -> str:
-        if self._phase == "hard" and self._rng.random() < 0.30:
-            return "delayed"
-        return "normal"
-
-    def _compute_demand_forecast(self) -> float:
-        """Return the forecast mean for the current day (no noise applied)."""
-        if self._phase == "easy":
-            return 80.0
-        elif self._phase == "medium":
-            peak_offset = np.pi * self._days_in_phase / 14.0
-            return 80.0 + 40.0 * np.sin(peak_offset)
+        # Expiry info
+        if self._stock_batches:
+            nearest = min(self._stock_batches, key=lambda b: b.expires_on_day)
+            days_until = nearest.expires_on_day - (self._day - 1 if self._day > 1 else 1)
+            expiring_soon_qty = sum(
+                b.quantity for b in self._stock_batches
+                if b.expires_on_day - (self._day - 1 if self._day > 1 else 1) <= 3
+            )
+            if days_until <= 2:
+                expiry_warning = f"URGENT: {expiring_soon_qty} units expire in {days_until} day(s)!"
+            elif days_until <= 5:
+                expiry_warning = f"Warning: {expiring_soon_qty} units expire in {days_until} days"
+            else:
+                expiry_warning = "No imminent expiry"
         else:
-            return 80.0  # hard: baseline only (spikes are unforecastable)
+            days_until = 999
+            expiring_soon_qty = 0
+            expiry_warning = "No stock on hand"
 
-    # ------------------------------------------------------------------ #
-    # Observation construction                                             #
-    # ------------------------------------------------------------------ #
+        # For reset (day=1), crisis_active is False
+        if self._day == 1:
+            crisis_active = False
 
-    def _make_observation(self, reward: float) -> SupplyChainObservation:
-        noise_map = {"easy": "low", "medium": "medium", "hard": "high"}
-        forecast = self._compute_demand_forecast()
-        forecast_noise = noise_map[self._phase]
-
+        # Pending summary for prompt
         if self._pending_orders:
             parts = [
                 f"{po.quantity} units in {po.arrives_in_days} day{'s' if po.arrives_in_days != 1 else ''}"
@@ -390,53 +563,105 @@ class AscAgentUnderDemandUncertainityRlEnvironment(Environment):
         else:
             pending_summary = "none"
 
-        prompt = (
-            "You are a warehouse manager. Here is today's situation:\n"
-            f"- Day: {self._day} of 30\n"
-            f"- Current stock: {self._stock} units\n"
-            f"- Demand forecast: ~{forecast:.0f} units today ({forecast_noise} uncertainty)\n"
-            f"- Orders arriving soon: {pending_summary}\n"
-            f"- Last 7-day service level: {self._last_7_day_service_level:.0%}\n"
-            f"- Budget remaining: ${self._budget:.0f}\n"
-            f"- Supplier status: {self._supplier_status}\n"
-            f"- Current difficulty: {self._phase}\n\n"
-            "Respond with exactly one JSON action:\n"
-            '{"action": "order", "quantity": <int>}\n'
-            '{"action": "emergency_restock", "quantity": <int>}\n'
-            '{"action": "hold"}'
-        )
+        supplier_status = "normal"
+        if self._loyalty_tier == "bronze" and self._rng.random() < 0.30:
+            supplier_status = "delayed"
 
+        forecast_noise_map = {"easy": "low", "medium": "medium", "hard": "high"}
+        forecast_noise = forecast_noise_map[phase]
+
+        base_demand = BASE_DEMAND[phase]
+        if phase == "medium":
+            seasonal = 1.0 + 0.3 * math.sin(math.pi * max(0, self._day - 8) / 7)
+            demand_forecast = base_demand * seasonal
+        else:
+            demand_forecast = base_demand
+
+        recent_neg_scores = self._neg_score_history[-3:]
+        emergency_surcharge_rate = SURCHARGE[self._loyalty_tier]
         phase_score = self._compute_phase_score()
+
+        prompt = (
+            f"PHARMANEGOTIATE — Day {self._day} of 30\n"
+            "═══════════════════════════════════════════════════════════\n\n"
+            "INVENTORY STATUS\n"
+            f"  Current stock         : {current_stock} units across {len(self._stock_batches)} batches\n"
+            f"  Nearest expiry        : {days_until} days ({expiring_soon_qty} units)\n"
+            f"  {expiry_warning}\n\n"
+            "MARKET CONDITIONS\n"
+            f"  Market price today    : Rs {market_price}/box\n"
+            f"  Your sell price       : Rs {self._last_sell_price}/box  (what you charged yesterday)\n"
+            f"  Demand forecast       : ~{demand_forecast:.0f} units ({forecast_noise} uncertainty)\n"
+            "  Price elasticity      : 1.5x shift per 10% price change vs market\n\n"
+            "SUPPLIER RELATIONSHIP\n"
+            f"  Trust score           : {self._trust_score:.2f} / 1.00\n"
+            f"  Supplier's message    : \"{self._supplier_last_message}\"\n"
+            f"  Last order accuracy   : {self._lead_time_accuracy}\n"
+            f"  Emergency surcharge   : {emergency_surcharge_rate}x unit cost  (signals loyalty tier)\n"
+            f"  Discount offered      : {self._proactive_discount}\n"
+            f"  Recent negotiation scores: {recent_neg_scores}   (last 3 days, 0.0–1.0)\n\n"
+            "SUPPLY CHAIN\n"
+            f"  Pending orders        : {pending_summary}\n"
+            f"  Supplier status       : {supplier_status}\n"
+            f"  Crisis active         : {crisis_active}\n\n"
+            "FINANCIALS\n"
+            f"  Budget remaining      : Rs {self._budget:.0f}\n"
+            f"  Last 7-day service SL : {self._last_7_day_service_level:.0%}\n"
+            f"  Unit cost (standard)  : Rs 200/box | Emergency: Rs {emergency_surcharge_rate * 200:.0f}/box\n"
+            "  Fixed order cost      : Rs 2,000 per order\n\n"
+            "EPISODE\n"
+            f"  Current phase         : {phase}\n"
+            f"  Day                   : {self._day} of 30\n\n"
+            "═══════════════════════════════════════════════════════════\n"
+            "Make four decisions today:\n"
+            "1. action_type: \"order\" | \"emergency_restock\" | \"hold\"\n"
+            "2. quantity: <int> (required if ordering, null for hold)\n"
+            "3. sell_price: <float> (Rs per box — affects demand you receive)\n"
+            "4. negotiation_message: <str> (professional message to GloveMaker Industries)\n\n"
+            "Respond with exactly one JSON:\n"
+            "{\"action_type\": \"...\", \"quantity\": ..., \"sell_price\": ..., \"negotiation_message\": \"...\"}"
+        )
 
         return SupplyChainObservation(
             day=self._day,
-            current_stock=self._stock,
-            demand_forecast=forecast,
+            current_stock=current_stock,
+            demand_forecast=round(demand_forecast, 2),
             forecast_noise=forecast_noise,
             pending_orders=list(self._pending_orders),
-            last_7_day_service_level=self._last_7_day_service_level,
-            holding_cost_per_unit=self.HOLDING_COST_PER_UNIT,
-            stockout_penalty=self.STOCKOUT_PENALTY,
-            budget_remaining=self._budget,
-            supplier_status=self._supplier_status,
-            current_phase=self._phase,
+            last_7_day_service_level=round(self._last_7_day_service_level, 4),
+            holding_cost_per_unit=0.5,
+            stockout_penalty=STOCKOUT_PENALTY,
+            budget_remaining=round(self._budget, 2),
+            supplier_status=supplier_status,
+            current_phase=phase,
             prompt=prompt,
+            # New inventory fields
+            days_until_nearest_expiry=days_until,
+            expiring_soon_qty=expiring_soon_qty,
+            expiry_warning=expiry_warning,
+            batch_count=len(self._stock_batches),
+            units_spoiled_today=self._last_units_spoiled,
+            # Market fields
+            market_price=market_price,
+            last_sell_price=self._last_sell_price,
+            # Supplier relationship signals
+            trust_score=round(self._trust_score, 4),
+            supplier_last_message=self._supplier_last_message,
+            lead_time_accuracy=self._lead_time_accuracy,
+            emergency_surcharge_rate=emergency_surcharge_rate,
+            proactive_discount_offered=self._proactive_discount,
+            recent_neg_scores=recent_neg_scores,
+            # Episode state
+            crisis_active=crisis_active,
+            # Live grading
             phase_score=phase_score,
-            actual_demand=round(self._last_actual_demand, 2),
-            actual_fulfilled=round(self._last_actual_fulfilled, 2),
+            actual_demand=0.0,
+            actual_fulfilled=0.0,
             reward=reward,
             done=self._done,
-            metadata={
+            metadata=metadata or {
                 "episode_id": self._episode_id,
                 "day": self._day,
-                "phase": self._phase,
-                "days_in_phase": self._days_in_phase,
-                "service_level_7d": round(self._last_7_day_service_level, 4),
-                "phase_score": phase_score,          # live grader score 0.0–1.0
-                "actual_demand": round(self._last_actual_demand, 2),
-                "actual_fulfilled": round(self._last_actual_fulfilled, 2),
-                "phase_total_cost": round(self._phase_total_cost, 2),
-                "phase_valid_actions": self._phase_valid_actions,
-                "phase_total_actions": self._phase_total_actions,
+                "phase": phase,
             },
         )
