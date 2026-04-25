@@ -33,7 +33,7 @@ class PhaseHistory:
     phase: Literal["easy", "medium", "hard"]
     demand_history: List[float]
     fulfilled_history: List[float]
-    total_cost: float               # total ordering cost (fixed + unit cost)
+    total_cost: float                                               # total ordering cost (fixed + unit cost)
     valid_actions: int
     total_actions: int
     spoilage_history: List[float] = field(default_factory=list)   # units spoiled each day
@@ -45,36 +45,35 @@ def grade_phase(history: PhaseHistory) -> float:
     Score a completed phase on a 0.0–1.0 scale.
 
     Args:
-        history: PhaseHistory collected during an episode.
+        history: Phase history collected during an episode.
 
     Returns:
         Float in [0.0, 1.0] — higher is better.
     """
     phase = history.phase
 
-    # ── Service score ─────────────────────────────────────────────────────────
-    target = {"easy": 0.95, "medium": 0.85, "hard": 0.75}[phase]
+    # ── Service score (30%) ───────────────────────────────────────────────────
+    target          = {"easy": 0.95, "medium": 0.85, "hard": 0.75}[phase]
     total_demand    = max(sum(history.demand_history), 1.0)
     total_fulfilled = sum(history.fulfilled_history)
     avg_sl          = total_fulfilled / total_demand
     service_score   = min(avg_sl / target, 1.0)
 
-    # ── Profit score ──────────────────────────────────────────────────────────
-    max_revenue = {"easy": 25_000.0, "medium": 35_000.0, "hard": 30_000.0}[phase]
+    # ── Profit score (25%) ────────────────────────────────────────────────────
+    max_revenue   = {"easy": 25_000.0, "medium": 35_000.0, "hard": 30_000.0}[phase]
     total_revenue = sum(history.revenue_history)
     profit_score  = max(0.0, min(total_revenue / max_revenue, 1.0))
 
-    # ── Cost score ────────────────────────────────────────────────────────────
+    # ── Cost score (20%) ──────────────────────────────────────────────────────
     max_cost   = {"easy": 15_000.0, "medium": 25_000.0, "hard": 30_000.0}[phase]
     cost_score = max(0.0, 1.0 - history.total_cost / max_cost)
 
-    # ── Spoilage score ────────────────────────────────────────────────────────
+    # ── Spoilage score (15%) ──────────────────────────────────────────────────
     total_spoiled  = sum(history.spoilage_history)
     spoilage_rate  = total_spoiled / total_demand
-    # 0% spoilage → 1.0; 20%+ spoilage → 0.0
-    spoilage_score = max(0.0, 1.0 - spoilage_rate * 5.0)
+    spoilage_score = max(0.0, 1.0 - spoilage_rate * 5.0)  # 20%+ spoilage → 0
 
-    # ── Validity score ────────────────────────────────────────────────────────
+    # ── Validity score (10%) ──────────────────────────────────────────────────
     validity_score = history.valid_actions / max(history.total_actions, 1)
 
     score = (

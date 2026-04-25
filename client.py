@@ -42,10 +42,12 @@ class AscAgentUnderDemandUncertainityRlEnv(
 
     def _step_payload(self, action: SupplyChainAction) -> Dict:
         """Convert SupplyChainAction to JSON payload."""
-        payload = {"action_type": action.action_type}
-        if action.quantity is not None:
-            payload["quantity"] = action.quantity
-        return payload
+        return {
+            "action_type": action.action_type,
+            "quantity": action.quantity,
+            "sell_price": action.sell_price,
+            "negotiation_message": action.negotiation_message,
+        }
 
     def _parse_result(self, payload: Dict) -> StepResult[SupplyChainObservation]:
         """Parse server response into StepResult[SupplyChainObservation]."""
@@ -68,6 +70,7 @@ class AscAgentUnderDemandUncertainityRlEnv(
         ]
 
         observation = SupplyChainObservation(
+            # Existing fields
             day=obs_data.get("day", 1),
             current_stock=obs_data.get("current_stock", 0),
             demand_forecast=obs_data.get("demand_forecast", 0.0),
@@ -80,6 +83,25 @@ class AscAgentUnderDemandUncertainityRlEnv(
             supplier_status=obs_data.get("supplier_status", "normal"),
             current_phase=obs_data.get("current_phase", "easy"),
             prompt=obs_data.get("prompt", ""),
+            # New inventory fields
+            days_until_nearest_expiry=obs_data.get("days_until_nearest_expiry", 999),
+            expiring_soon_qty=obs_data.get("expiring_soon_qty", 0),
+            expiry_warning=obs_data.get("expiry_warning", "No stock on hand"),
+            batch_count=obs_data.get("batch_count", 0),
+            units_spoiled_today=obs_data.get("units_spoiled_today", 0),
+            # Market fields
+            market_price=obs_data.get("market_price", 265.0),
+            last_sell_price=obs_data.get("last_sell_price", 265.0),
+            # Supplier relationship signals
+            trust_score=obs_data.get("trust_score", 0.8),
+            supplier_last_message=obs_data.get("supplier_last_message", ""),
+            lead_time_accuracy=obs_data.get("lead_time_accuracy", "on time"),
+            emergency_surcharge_rate=obs_data.get("emergency_surcharge_rate", 2.5),
+            proactive_discount_offered=obs_data.get("proactive_discount_offered", False),
+            recent_neg_scores=obs_data.get("recent_neg_scores", []),
+            # Episode state
+            crisis_active=obs_data.get("crisis_active", False),
+            # Live grading
             phase_score=obs_data.get("phase_score", 0.0),
             actual_demand=obs_data.get("actual_demand", 0.0),
             actual_fulfilled=obs_data.get("actual_fulfilled", 0.0),

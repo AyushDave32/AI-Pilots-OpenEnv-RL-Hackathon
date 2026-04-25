@@ -5,9 +5,10 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-Data models for the Adaptive Supply Chain RL Environment.
+Data models for the PharmaNegotiate Supply Chain RL Environment.
 
-Simulates a warehouse manager making daily inventory ordering decisions
+Simulates MediStock Pvt. Ltd., a surgical gloves distributor in Mumbai,
+managing perishable pharmaceutical inventory with supplier negotiation
 over a 30-day episode under uncertain demand and variable supplier lead times.
 """
 
@@ -27,6 +28,22 @@ class SupplyChainAction(Action):
         default=None,
         description="Units to order (required for 'order' and 'emergency_restock'; None for 'hold')",
     )
+    sell_price: float = Field(
+        default=265.0,
+        description="Rs per box sold to hospitals today; affects demand via price elasticity",
+    )
+    negotiation_message: str = Field(
+        default="",
+        description="Natural language message to GloveMaker Industries; empty = score 0",
+    )
+
+
+class StockBatch(BaseModel):
+    """A batch of stock with its own expiry date (for FEFO inventory management)."""
+
+    quantity: int = Field(..., description="Number of units in this batch")
+    expires_on_day: int = Field(..., description="Episode day on which this batch spoils if unsold")
+    arrived_on_day: int = Field(..., description="Episode day this batch arrived (for logging)")
 
 
 class PendingOrder(BaseModel):
@@ -37,12 +54,13 @@ class PendingOrder(BaseModel):
 
 
 class SupplyChainObservation(Observation):
-    """Observation from the supply chain environment.
+    """Observation from the PharmaNegotiate supply chain environment.
 
     Note: `done`, `reward`, and `metadata` are inherited from Observation base class.
     Do NOT redefine them here.
     """
 
+    # --- EXISTING FIELDS ---
     day: int = Field(..., description="Current day (1–30)")
     current_stock: int = Field(..., description="Units currently in the warehouse")
     demand_forecast: float = Field(..., description="Forecasted demand for today")
@@ -61,7 +79,7 @@ class SupplyChainObservation(Observation):
     stockout_penalty: float = Field(
         default=50.0, description="Penalty per stockout event"
     )
-    budget_remaining: float = Field(..., description="Remaining budget in dollars")
+    budget_remaining: float = Field(..., description="Remaining budget in Rs")
     supplier_status: Literal["normal", "delayed"] = Field(
         ..., description="Current supplier reliability status"
     )
@@ -70,6 +88,56 @@ class SupplyChainObservation(Observation):
     )
     prompt: str = Field(
         ..., description="Natural language prompt for LLM-based agents"
+    )
+
+    # --- NEW FIELDS: Inventory ---
+    days_until_nearest_expiry: int = Field(
+        default=999, description="Days until the nearest-expiring batch expires (999 if no stock)"
+    )
+    expiring_soon_qty: int = Field(
+        default=0, description="Units expiring within 3 days"
+    )
+    expiry_warning: str = Field(
+        default="No stock on hand", description="Human-readable expiry urgency message"
+    )
+    batch_count: int = Field(
+        default=0, description="Number of distinct live stock batches"
+    )
+    units_spoiled_today: int = Field(
+        default=0, description="Units that expired and were lost this step"
+    )
+
+    # --- NEW FIELDS: Market ---
+    market_price: float = Field(
+        default=265.0, description="Today's market price (Rs/box)"
+    )
+    last_sell_price: float = Field(
+        default=265.0, description="The sell price the agent used yesterday"
+    )
+
+    # --- NEW FIELDS: Supplier relationship signals (agent infers loyalty tier from these) ---
+    trust_score: float = Field(
+        default=0.8, description="Observable trust score 0.0–1.0"
+    )
+    supplier_last_message: str = Field(
+        default="", description="One-sentence supplier response from previous step"
+    )
+    lead_time_accuracy: str = Field(
+        default="on time", description="'on time' | '1 day late' | 'X days late'"
+    )
+    emergency_surcharge_rate: float = Field(
+        default=2.5, description="Emergency restock surcharge multiplier — reveals loyalty tier"
+    )
+    proactive_discount_offered: bool = Field(
+        default=False, description="True if supplier proactively offered a discount today"
+    )
+    recent_neg_scores: List[float] = Field(
+        default_factory=list, description="Last 3 negotiation scores (0.0–1.0)"
+    )
+
+    # --- NEW FIELDS: Episode state ---
+    crisis_active: bool = Field(
+        default=False, description="True on days 21–25 (factory fire crisis)"
     )
 
     # Live grading fields (serialized directly — metadata is stripped by the framework)
