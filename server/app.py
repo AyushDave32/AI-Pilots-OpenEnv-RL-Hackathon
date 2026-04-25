@@ -36,18 +36,18 @@ except Exception as e:  # pragma: no cover
     ) from e
 
 try:
-    from ..models import AscAgentUnderDemandUncertainityRlAction, AscAgentUnderDemandUncertainityRlObservation
+    from ..models import SupplyChainAction, SupplyChainObservation
     from .asc_agent_under_demand_uncertainity_rl_env_environment import AscAgentUnderDemandUncertainityRlEnvironment
-except ModuleNotFoundError:
-    from models import AscAgentUnderDemandUncertainityRlAction, AscAgentUnderDemandUncertainityRlObservation
+except (ImportError, ModuleNotFoundError):
+    from models import SupplyChainAction, SupplyChainObservation
     from server.asc_agent_under_demand_uncertainity_rl_env_environment import AscAgentUnderDemandUncertainityRlEnvironment
 
 
 # Create the app with web interface and README integration
 app = create_app(
     AscAgentUnderDemandUncertainityRlEnvironment,
-    AscAgentUnderDemandUncertainityRlAction,
-    AscAgentUnderDemandUncertainityRlObservation,
+    SupplyChainAction,
+    SupplyChainObservation,
     env_name="asc_agent_under_demand_uncertainity_rl_env",
     max_concurrent_envs=1,  # increase this number to allow more concurrent WebSocket sessions
 )
