@@ -5,3 +5,21 @@ runtime: fastapi
 app: server.app:app
 port: 8000
 
+tasks:
+  - id: easy_phase_inventory
+    name: "Easy Inventory Management — Loyal Supplier"
+    description: "Manage perishable pharmaceutical inventory with a cooperative Gold-tier supplier. Learn basic negotiation and FEFO inventory management."
+    difficulty: easy
+    max_steps: 30
+
+  - id: medium_phase_inventory
+    name: "Medium Inventory Management — Neutral Supplier"
+    description: "Manage seasonal perishable inventory with a Silver-tier supplier. Maintain relationship through consistent ordering and concrete negotiation offers."
+    difficulty: medium
+    max_steps: 30
+
+  - id: hard_phase_inventory
+    name: "Hard Inventory Management — Adversarial Supplier + Crisis"
+    description: "Manage volatile perishable inventory with a Bronze-tier supplier. Survive the day-21 factory crisis through relationship-building and strategic negotiation."
+    difficulty: hard
+    max_steps: 30
