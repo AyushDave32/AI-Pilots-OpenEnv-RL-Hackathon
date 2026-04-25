@@ -11,7 +11,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "openenv-asc_agent_under_demand_uncertainity_rl_env"
 version = "0.1.0"
-description = "Asc Agent Under Demand Uncertainity Rl Env environment for OpenEnv"
+description = "Adaptive Supply Chain RL Environment with perishable inventory, supplier hidden state, sell-side pricing, and LLM-native negotiation actions"
 requires-python = ">=3.10"
 dependencies = [
     # Core OpenEnv runtime (provides FastAPI server + HTTP client types)
