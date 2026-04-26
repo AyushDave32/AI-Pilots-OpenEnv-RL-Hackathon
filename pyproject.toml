@@ -21,6 +21,8 @@ dependencies = [
     # Environment-specific dependencies
     "numpy>=1.24.0",
     "openai>=1.0.0",
+    "jupyter>=1.1.1",
+    "nbconvert>=7.17.1",
 ]
 
 [project.optional-dependencies]
