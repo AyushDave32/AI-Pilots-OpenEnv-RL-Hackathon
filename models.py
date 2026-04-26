@@ -5,11 +5,12 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-Data models for the PharmaNegotiate Supply Chain RL Environment.
+Data models for the Adaptive Supply Chain RL Environment.
 
-Simulates MediStock Pvt. Ltd., a surgical gloves distributor in Mumbai,
-managing perishable pharmaceutical inventory with supplier negotiation
+General-purpose perishable goods inventory management with supplier negotiation
 over a 30-day episode under uncertain demand and variable supplier lead times.
+Domain-agnostic: works for pharmaceuticals, food logistics, electronics, or any
+other industry with perishable inventory and supplier relationships.
 """
 
 from typing import List, Literal, Optional
@@ -30,11 +31,11 @@ class SupplyChainAction(Action):
     )
     sell_price: float = Field(
         default=265.0,
-        description="Rs per box sold to hospitals today; affects demand via price elasticity",
+        description="Price per unit sold to customers today; affects demand via price elasticity",
     )
     negotiation_message: str = Field(
         default="",
-        description="Natural language message to GloveMaker Industries; empty = score 0",
+        description="Natural language message to your supplier; empty = score 0",
     )
 
 
@@ -54,7 +55,7 @@ class PendingOrder(BaseModel):
 
 
 class SupplyChainObservation(Observation):
-    """Observation from the PharmaNegotiate supply chain environment.
+    """Observation from the Adaptive Supply Chain environment.
 
     Note: `done`, `reward`, and `metadata` are inherited from Observation base class.
     Do NOT redefine them here.
