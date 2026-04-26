@@ -66,16 +66,16 @@ def test_partnership_keyword():
 
 def test_zero_defaults_keyword():
     r = score_negotiation(
-        "MediStock has zero defaults on all past orders with your team.", BASE_STATE
+        "Our company has zero defaults on all past orders with your team.", BASE_STATE
     )
     assert r["relationship_referenced"]
 
 
 # ── Concrete offer ────────────────────────────────────────────────────────────
 
-def test_rs_amount_concrete():
+def test_currency_amount_concrete():
     r = score_negotiation(
-        "We offer advance payment of Rs 24000 to secure this order.", BASE_STATE
+        "We offer advance payment of $24000 to secure this order.", BASE_STATE
     )
     assert r["concrete_offer_made"]
 
@@ -109,8 +109,8 @@ def test_within_days_concrete():
 
 def test_all_three_pass_score_1():
     msg = (
-        "GloveMaker team — MediStock has maintained zero defaults across all past orders. "
-        "We request 120 units and offer immediate advance payment of Rs 24,000."
+        "Dear supplier — our company has maintained zero defaults across all past orders. "
+        "We request 120 units and offer immediate advance payment of $24,000."
     )
     r = score_negotiation(msg, BASE_STATE)
     assert r["total_score"] == 1.0
@@ -146,9 +146,9 @@ def test_early_day_loose_relationship():
 
 def test_crisis_day_full_message():
     msg = (
-        "GloveMaker team — as a consistent long-term partner with zero payment defaults, "
+        "Dear supplier — as a consistent long-term partner with zero payment defaults, "
         "we formally request priority allocation of 120 units during this crisis period. "
-        "We offer immediate advance payment of Rs 24,000."
+        "We offer immediate advance payment of $24,000."
     )
     r = score_negotiation(msg, CRISIS_STATE, phase="hard", checks_needed=3)
     assert r["total_score"] == 1.0

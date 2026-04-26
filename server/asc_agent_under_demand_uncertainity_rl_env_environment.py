@@ -5,19 +5,22 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-PharmaNegotiate Supply Chain RL Environment.
+Adaptive Supply Chain RL Environment.
 
-Simulates MediStock Pvt. Ltd. managing perishable surgical gloves inventory
-over a 30-day episode. The agent must:
+General-purpose perishable goods inventory management over a 30-day episode.
+Domain-agnostic: works for pharmaceuticals, food logistics, electronics, or any
+other industry with perishable inventory and supplier relationships.
+
+The agent must:
   1. Buy-side decisions — order type, quantity, timing (FEFO, expiry-aware)
   2. Sell-side decisions — set daily sell price via price elasticity
   3. Relationship management — write daily supplier negotiation messages
   4. World modeling — infer supplier's hidden loyalty tier from observable signals
 
-The supplier (GloveMaker Industries) maintains hidden state (loyalty tier,
-supplier mood, order regularity) that drives costs and crisis allocation.
-On days 21–25 a factory fire reduces capacity to 30% — only loyal customers
-get full allocation.
+The supplier maintains hidden state (loyalty tier, supplier mood, order
+regularity) that drives costs and crisis allocation.
+On days 21–25 a supply disruption reduces capacity to 30% — only loyal
+customers get full allocation.
 """
 
 import math
@@ -69,11 +72,11 @@ RUBRIC_CHECKS_NEEDED = {"easy": 1, "medium": 2, "hard": 3}
 
 class AscAgentUnderDemandUncertainityRlEnvironment(Environment):
     """
-    PharmaNegotiate Supply Chain RL Environment.
+    Adaptive Supply Chain RL Environment.
 
-    The agent manages perishable pharmaceutical inventory with:
+    The agent manages perishable goods inventory with:
     - FEFO (First Expired First Out) batch-level inventory tracking
-    - Sell-side price elasticity (agent sets daily hospital sell price)
+    - Sell-side price elasticity (agent sets daily customer sell price)
     - Supplier hidden state (loyalty tier: bronze/silver/gold)
     - LLM-native negotiation action (scored by rubric, drives loyalty)
     - Day 21–25 factory crisis (capacity 30%; tier determines allocation)
@@ -166,7 +169,7 @@ class AscAgentUnderDemandUncertainityRlEnvironment(Environment):
         self._supplier_neg_threshold_bonus = 0.0
 
         # Observable supplier signals reset
-        self._supplier_last_message = "Welcome, MediStock. We look forward to a productive partnership."
+        self._supplier_last_message = "Welcome. We look forward to a productive partnership."
         self._lead_time_accuracy = "on time"
         self._proactive_discount = False
         self._last_units_spoiled = 0
@@ -189,7 +192,7 @@ class AscAgentUnderDemandUncertainityRlEnvironment(Environment):
         return self._build_observation(reward=0.0)
 
     def step(self, action: SupplyChainAction) -> SupplyChainObservation:
-        """Execute one day in the PharmaNegotiate simulation."""
+        """Execute one day in the supply chain simulation."""
 
         # STEP 1 — Guard
         if self._done:
@@ -582,15 +585,15 @@ class AscAgentUnderDemandUncertainityRlEnvironment(Environment):
         phase_score = self._compute_phase_score()
 
         prompt = (
-            f"PHARMANEGOTIATE — Day {self._day} of 30\n"
+            f"ADAPTIVE SUPPLY CHAIN — Day {self._day} of 30\n"
             "═══════════════════════════════════════════════════════════\n\n"
             "INVENTORY STATUS\n"
             f"  Current stock         : {current_stock} units across {len(self._stock_batches)} batches\n"
             f"  Nearest expiry        : {days_until} days ({expiring_soon_qty} units)\n"
             f"  {expiry_warning}\n\n"
             "MARKET CONDITIONS\n"
-            f"  Market price today    : Rs {market_price}/box\n"
-            f"  Your sell price       : Rs {self._last_sell_price}/box  (what you charged yesterday)\n"
+            f"  Market price today    : {market_price}/unit\n"
+            f"  Your sell price       : {self._last_sell_price}/unit  (what you charged yesterday)\n"
             f"  Demand forecast       : ~{demand_forecast:.0f} units ({forecast_noise} uncertainty)\n"
             "  Price elasticity      : 1.5x shift per 10% price change vs market\n\n"
             "SUPPLIER RELATIONSHIP\n"
@@ -605,10 +608,10 @@ class AscAgentUnderDemandUncertainityRlEnvironment(Environment):
             f"  Supplier status       : {supplier_status}\n"
             f"  Crisis active         : {crisis_active}\n\n"
             "FINANCIALS\n"
-            f"  Budget remaining      : Rs {self._budget:.0f}\n"
+            f"  Budget remaining      : {self._budget:.0f}\n"
             f"  Last 7-day service SL : {self._last_7_day_service_level:.0%}\n"
-            f"  Unit cost (standard)  : Rs 200/box | Emergency: Rs {emergency_surcharge_rate * 200:.0f}/box\n"
-            "  Fixed order cost      : Rs 2,000 per order\n\n"
+            f"  Unit cost (standard)  : 200/unit | Emergency: {emergency_surcharge_rate * 200:.0f}/unit\n"
+            "  Fixed order cost      : 2,000 per order\n\n"
             "EPISODE\n"
             f"  Current phase         : {phase}\n"
             f"  Day                   : {self._day} of 30\n\n"
@@ -616,8 +619,8 @@ class AscAgentUnderDemandUncertainityRlEnvironment(Environment):
             "Make four decisions today:\n"
             "1. action_type: \"order\" | \"emergency_restock\" | \"hold\"\n"
             "2. quantity: <int> (required if ordering, null for hold)\n"
-            "3. sell_price: <float> (Rs per box — affects demand you receive)\n"
-            "4. negotiation_message: <str> (professional message to GloveMaker Industries)\n\n"
+            "3. sell_price: <float> (price per unit — affects demand you receive)\n"
+            "4. negotiation_message: <str> (professional message to your supplier)\n\n"
             "Respond with exactly one JSON:\n"
             "{\"action_type\": \"...\", \"quantity\": ..., \"sell_price\": ..., \"negotiation_message\": \"...\"}"
         )
