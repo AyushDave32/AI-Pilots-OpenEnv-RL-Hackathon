@@ -41,8 +41,8 @@ except (ImportError, ModuleNotFoundError):
 # ---------------------------------------------------------------------------
 
 SHELF_LIFE_DAYS = 15
-UNIT_COST_STANDARD = 200
-FIXED_ORDER_COST = 2000
+UNIT_COST_STANDARD = 2
+FIXED_ORDER_COST = 20
 STOCKOUT_PENALTY = 50.0
 SPOILAGE_PENALTY_PER_UNIT = 20.0
 OVERSTOCK_THRESHOLD = 300
@@ -372,7 +372,7 @@ class AscAgentUnderDemandUncertainityRlEnvironment(Environment):
         current_stock = sum(b.quantity for b in self._stock_batches)
 
         # STEP 12 — Sell-side profit and penalties
-        gross_profit = (sell_price - UNIT_COST_STANDARD) * units_fulfilled
+        gross_profit = 3.0 * units_fulfilled
         reward += gross_profit
         if stockout_occurred:
             reward -= STOCKOUT_PENALTY
@@ -610,8 +610,8 @@ class AscAgentUnderDemandUncertainityRlEnvironment(Environment):
             "FINANCIALS\n"
             f"  Budget remaining      : {self._budget:.0f}\n"
             f"  Last 7-day service SL : {self._last_7_day_service_level:.0%}\n"
-            f"  Unit cost (standard)  : 200/unit | Emergency: {emergency_surcharge_rate * 200:.0f}/unit\n"
-            "  Fixed order cost      : 2,000 per order\n\n"
+            f"  Unit cost (standard)  : {UNIT_COST_STANDARD}/unit | Emergency: {emergency_surcharge_rate * UNIT_COST_STANDARD:.1f}/unit\n"
+            f"  Fixed order cost      : {FIXED_ORDER_COST} per order\n\n"
             "EPISODE\n"
             f"  Current phase         : {phase}\n"
             f"  Day                   : {self._day} of 30\n\n"
