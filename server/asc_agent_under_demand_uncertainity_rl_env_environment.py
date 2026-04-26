@@ -48,8 +48,24 @@ SPOILAGE_PENALTY_PER_UNIT = 20.0
 OVERSTOCK_THRESHOLD = 300
 OPTIMAL_STOCK_RANGE = (50, 300)
 PRICE_ELASTICITY = 1.5
-NEG_EPISODE_CAP = 30.0
+NEG_EPISODE_CAP = 10.0          # FIX: was 30 — reduced to lower negotiation noise
+NEG_SCORE_MULTIPLIER = 3.0      # FIX: was 10 — less noisy signal per step
 CRISIS_DAYS = set(range(21, 26))
+
+# FIX 1 — Reward scale: divide large costs into [-100, +100] target range
+# order 100 units → raw -22000 → normalised -22.0 (comparable to other signals)
+REWARD_NORM_SCALE = 100.0
+REWARD_CLIP_MIN   = -100.0
+REWARD_CLIP_MAX   =  100.0
+
+# FIX 7 — Action safety clamps (prevents chaotic exploration)
+QUANTITY_MIN  = 10
+QUANTITY_MAX  = 500
+PRICE_MIN     = 100.0
+PRICE_MAX     = 400.0
+
+# FIX 4 — Early budget warning threshold
+BUDGET_WARNING_THRESHOLD = 3000.0   # warn before budget goes negative
 
 MARKET_PRICE = {"easy": 265.0, "medium": 285.0, "hard": 310.0}
 BASE_DEMAND = {"easy": 80.0, "medium": 100.0, "hard": 90.0}
@@ -207,11 +223,20 @@ class AscAgentUnderDemandUncertainityRlEnvironment(Environment):
         if action.action_type in ("order", "emergency_restock"):
             if action.quantity is None or action.quantity <= 0:
                 malformed = True
-                reward -= 10.0
+                reward -= 10.0  # kept at -10 (now comparable after normalization)
                 action = SupplyChainAction(
                     action_type="hold",
                     quantity=None,
                     sell_price=action.sell_price if action.sell_price and action.sell_price > 0 else MARKET_PRICE[phase],
+                    negotiation_message=action.negotiation_message,
+                )
+            else:
+                # FIX 7 — Clamp quantity to safe exploration range
+                clamped_qty = int(np.clip(action.quantity, QUANTITY_MIN, QUANTITY_MAX))
+                action = SupplyChainAction(
+                    action_type=action.action_type,
+                    quantity=clamped_qty,
+                    sell_price=action.sell_price,
                     negotiation_message=action.negotiation_message,
                 )
 
@@ -222,6 +247,15 @@ class AscAgentUnderDemandUncertainityRlEnvironment(Environment):
                 action_type=action.action_type,
                 quantity=action.quantity,
                 sell_price=MARKET_PRICE[phase],
+                negotiation_message=action.negotiation_message,
+            )
+        else:
+            # FIX 7 — Clamp price to safe exploration range
+            clamped_price = float(np.clip(action.sell_price, PRICE_MIN, PRICE_MAX))
+            action = SupplyChainAction(
+                action_type=action.action_type,
+                quantity=action.quantity,
+                sell_price=clamped_price,
                 negotiation_message=action.negotiation_message,
             )
 
@@ -242,7 +276,8 @@ class AscAgentUnderDemandUncertainityRlEnvironment(Environment):
         expired = [b for b in self._stock_batches if b.expires_on_day <= self._day]
         units_spoiled = sum(b.quantity for b in expired)
         self._stock_batches = [b for b in self._stock_batches if b.expires_on_day > self._day]
-        reward -= SPOILAGE_PENALTY_PER_UNIT * units_spoiled
+        # FIX 1 — Spoilage penalty normalised (moved to STEP 12 block to avoid double-counting)
+        # Raw spoilage tracked here; penalty applied after normalisation below
         self._last_units_spoiled = units_spoiled
 
         # STEP 5 — Process pending order arrivals
@@ -292,7 +327,8 @@ class AscAgentUnderDemandUncertainityRlEnvironment(Environment):
             lead_time_promised = max(1, base_lt + LEAD_MODIFIER[self._loyalty_tier])
             my_actual = action.quantity
             order_cost = FIXED_ORDER_COST + my_actual * UNIT_COST_STANDARD
-            reward -= order_cost
+            # FIX 1 — Normalize order cost: -22000 raw → -22.0 normalised
+            reward -= order_cost / REWARD_NORM_SCALE
             self._budget -= order_cost
             self._phase_total_cost += order_cost
             self._consecutive_holds = 0
@@ -303,7 +339,8 @@ class AscAgentUnderDemandUncertainityRlEnvironment(Environment):
             lead_time_promised = 1
             my_actual = action.quantity
             order_cost = FIXED_ORDER_COST + my_actual * UNIT_COST_STANDARD * surcharge_rate
-            reward -= order_cost
+            # FIX 1 — Normalize emergency cost too
+            reward -= order_cost / REWARD_NORM_SCALE
             self._budget -= order_cost
             self._phase_total_cost += order_cost
             self._consecutive_holds = 0
@@ -314,8 +351,11 @@ class AscAgentUnderDemandUncertainityRlEnvironment(Environment):
             if self._consecutive_holds >= 3:
                 self._order_regularity = max(0.0, self._order_regularity - 0.02)
 
+        # FIX 4 — Early budget warning (penalise BEFORE going negative)
+        if 0 < self._budget < BUDGET_WARNING_THRESHOLD:
+            reward -= 5.0  # mild early warning signal
         if self._budget < 0:
-            reward -= 100.0
+            reward -= 20.0  # was 100 raw — now scaled to match other penalties
             self._order_regularity = max(0.0, self._order_regularity - 0.10)
 
         # STEP 8 — Apply crisis allocation
@@ -373,13 +413,23 @@ class AscAgentUnderDemandUncertainityRlEnvironment(Environment):
 
         # STEP 12 — Sell-side profit and penalties
         gross_profit = (sell_price - UNIT_COST_STANDARD) * units_fulfilled
-        reward += gross_profit
+        # FIX 1 — Normalize gross profit to comparable scale
+        reward += gross_profit / REWARD_NORM_SCALE
         if stockout_occurred:
-            reward -= STOCKOUT_PENALTY
+            reward -= STOCKOUT_PENALTY / REWARD_NORM_SCALE   # -50 → -0.5
         excess = max(0, current_stock - OVERSTOCK_THRESHOLD)
-        reward -= 0.5 * excess
+        reward -= (0.5 * excess) / REWARD_NORM_SCALE
         if OPTIMAL_STOCK_RANGE[0] <= current_stock <= OPTIMAL_STOCK_RANGE[1]:
             reward += 5.0
+
+        # FIX 2 — Dense intermediate rewards: immediate signal every step
+        # Helps credit assignment for delayed arrivals and spoilage
+        service_rate = units_fulfilled / max(actual_demand, 1)
+        reward += 3.0 * service_rate              # +3 for perfect fulfillment, scaled down for partial
+        reward -= 2.0 * (units_spoiled / max(units_spoiled + units_fulfilled + 1, 1))  # proportion spoiled
+
+        # FIX 3 — Normalise spoilage penalty too
+        reward -= (SPOILAGE_PENALTY_PER_UNIT * units_spoiled) / REWARD_NORM_SCALE
 
         # STEP 13 — Sell price regularity effect on order_regularity
         price_deviation = abs(sell_price - market_price) / market_price
@@ -404,7 +454,9 @@ class AscAgentUnderDemandUncertainityRlEnvironment(Environment):
         except Exception:
             neg_score = 0.0
 
-        neg_bonus = min(neg_score * 10.0, max(0.0, NEG_EPISODE_CAP - self._neg_bonus_total))
+        # FIX 5 — Reduce negotiation noise: multiplier 10→3, cap 30→10
+        # Prevents negotiation from dominating profit/spoilage signals
+        neg_bonus = min(neg_score * NEG_SCORE_MULTIPLIER, max(0.0, NEG_EPISODE_CAP - self._neg_bonus_total))
         self._neg_bonus_total += neg_bonus
         reward += neg_bonus
 
@@ -459,6 +511,10 @@ class AscAgentUnderDemandUncertainityRlEnvironment(Environment):
         self._last_7_day_service_level = sum(f7) / max(sum(d7), 1)
 
         # STEP 17 — Compute expiry info for observation (handled in _build_observation)
+
+        # FIX 9 — Clip final reward to [-100, +100] — prevents extreme outliers
+        # blocking gradient flow and causing the model to output garbage
+        reward = float(np.clip(reward, REWARD_CLIP_MIN, REWARD_CLIP_MAX))
 
         # STEP 18 — Increment day and check done
         self._day += 1
