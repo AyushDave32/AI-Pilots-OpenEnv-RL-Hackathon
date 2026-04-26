@@ -8,7 +8,7 @@ port: 8000
 tasks:
   - id: easy_phase_inventory
     name: "Easy Inventory Management — Loyal Supplier"
-    description: "Manage perishable pharmaceutical inventory with a cooperative Gold-tier supplier. Learn basic negotiation and FEFO inventory management."
+    description: "Manage perishable goods inventory with a cooperative Gold-tier supplier. Learn basic negotiation and FEFO inventory management."
     difficulty: easy
     max_steps: 30
 

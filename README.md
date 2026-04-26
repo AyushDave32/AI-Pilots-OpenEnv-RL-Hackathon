@@ -1,8 +1,8 @@
 ---
-title: Adaptive Supply Chain Agent Under Demand Uncertainty RL Environment
-emoji: 🏭
-colorFrom: yellow
-colorTo: red
+title: Adaptive Supply Chain RL Environment
+emoji: 📦
+colorFrom: blue
+colorTo: green
 sdk: docker
 pinned: false
 app_port: 8000
@@ -11,106 +11,140 @@ tags:
   - openenv
   - reinforcement-learning
   - supply-chain
-  - curriculum-learning
+  - multi-agent
+  - world-modeling
+  - theory-of-mind
+  - inventory-management
+  - negotiation
 ---
 
 # Adaptive Supply Chain RL Environment
 
-An **OpenEnv-compliant RL environment** for the Meta / PyTorch / Hugging Face OpenEnv Hackathon.
+**A general-purpose OpenEnv RL environment where LLM agents manage perishable inventory, negotiate with a reactive supplier, and survive supply disruptions. Domain-agnostic — configure for any industry.**
 
-The agent plays a **warehouse manager** making daily inventory ordering decisions over a **30-day episode** under uncertain demand, variable supplier lead times, and a multi-component reward function. Difficulty escalates automatically through three curriculum phases.
-
----
-
-## The Problem
-
-> *"You manage a warehouse. Every day you decide how much stock to order. Demand is uncertain, suppliers are unreliable, and holding too much stock is as costly as running out."*
-
-The agent must balance:
-- **Ordering cost** — fixed + per-unit cost to place orders
-- **Stockout risk** — large penalty if demand exceeds available stock
-- **Overstock waste** — penalty for carrying more than 200 units
-- **Service level** — fraction of demand successfully fulfilled
+> *"You manage perishable goods inventory over 30 days. Every unit expires 15 days after arrival. Your supplier has hidden loyalty tiers that determine your costs and crisis allocation. On day 21, supply capacity drops to 30%. Your relationship history decides how much you receive."*
 
 ---
 
-## Curriculum Phases
+## What This Environment Tests
 
-A **single environment** automatically advances through 3 difficulty phases based on recent performance:
+Managing perishable goods under supplier uncertainty forces an LLM to reason in ways that pure numerical RL cannot:
+
+- **Order the right quantity** given stock that expires 15 days after arrival
+- **Set the right sell price** daily — price elasticity means pricing too high shrinks demand, too low shrinks margin
+- **Model a reactive supplier's hidden state** — infer loyalty tier from observable signals (surcharge rates, message tone, lead time accuracy)
+- **Write professional negotiation messages** that build long-term supplier trust and determine crisis allocation
+
+Traditional RL policies can optimise the numerical decisions. They cannot write the negotiation messages that determine supplier priority during a crisis. This is why the environment is built for LLMs.
+
+**Themes:** Theme #1 (Multi-Agent — theory-of-mind supplier modeling) + Theme #3.1 (World Modeling — professional supply chain task)
+
+---
+
+## Configurable For Any Industry
+
+The environment logic, reward function, and graders are completely domain-agnostic. To adapt to a specific industry, only the prompt text and constants need updating — no code logic changes required.
+
+| Industry | Perishable goods example | Crisis analog |
+|----------|--------------------------|---------------|
+| Pharmaceutical distribution | Medicines, diagnostics | Factory shutdown |
+| Cold-chain food logistics | Dairy, fresh produce | Harvest failure |
+| Electronics / semiconductors | Components with shelf life | Chip fab disruption |
+| Blood bank / medical | Blood products, vaccines | Donation shortage |
+| Fast fashion / apparel | Seasonal inventory | Factory capacity cuts |
+
+---
+
+## Core Mechanics
+
+### 1. Perishable Inventory — Batch Tracking + FEFO
+
+Every order creates a stock batch expiring 15 days after arrival. Demand is fulfilled FEFO (First Expired First Out). Unsold expired stock incurs a spoilage penalty of Rs 20/unit.
+
+### 2. Sell-Side Pricing with Demand Elasticity
+
+The agent sets a daily sell price. Actual demand is computed as:
+```
+actual_demand = base_demand × (market_price / sell_price)^1.5
+```
+Price below market increases demand but compresses margin. Price above market shrinks demand.
+
+### 3. Supplier Hidden State — Theory-of-Mind
+
+The supplier maintains three hidden variables the agent never sees directly:
 
 ```
-Day 1 ──► [EASY] ──(7-day service level > 90%)──► [MEDIUM] ──(90% again)──► [HARD] ──► Day 30
+loyalty_tier    : "bronze" | "silver" | "gold"   ← never shown
+supplier_mood   : float 0.0–1.0                   ← never shown
+order_regularity: float 0.0–1.0                   ← never shown
 ```
 
-| Phase  | Demand Pattern               | Lead Time       | Forecast Noise | Service Target |
-|--------|------------------------------|-----------------|----------------|----------------|
-| Easy   | Stable ~80 units/day         | Fixed 3 days    | ±10%           | 95%            |
-| Medium | Seasonal wave (peak day 15)  | 2–5 days random | ±25%           | 85%            |
-| Hard   | Baseline + random spikes     | 2–10 days + delays | ±40%        | 75%            |
+The agent observes only the **consequences** of these hidden variables:
 
-Each phase is also exposed as an **independent task** for direct evaluation:
-- `easy_phase_inventory`
-- `medium_phase_inventory`
-- `hard_phase_inventory`
+| Signal | What it reveals |
+|--------|----------------|
+| `emergency_surcharge_rate` | 2.5×=Gold, 3.0×=Silver, 4.0×=Bronze |
+| `supplier_last_message` tone | Warm=Gold, Neutral=Silver, Cold=Bronze |
+| `lead_time_accuracy` | Consistent delays = Bronze |
+| `proactive_discount_offered` | Only Gold/Silver get proactive discounts |
+| `recent_neg_scores` | Your last 3 negotiation scores (0.0–1.0) |
+
+### 4. Day-21 Supply Disruption
+
+Days 21–25: factory capacity drops to 30%. Crisis allocation by loyalty tier:
+
+| Tier | Order Fulfilled | Emergency Surcharge | Lead Time |
+|------|----------------|---------------------|-----------|
+| Gold | 100% | 2.5× unit cost | −1 day (faster) |
+| Silver | 80% | 3.0× unit cost | As promised |
+| Bronze | 50% | 4.0× unit cost | +1–2 days extra |
+
+### 5. LLM-Native Negotiation Action
+
+Every day the agent writes a natural language message to the supplier. Scored by a 3-check rubric:
+1. **Relationship referenced** — mentions past order history, track record, partnership
+2. **Concrete offer made** — specific payment amount, advance payment, quantity guarantee
+3. **Tone appropriate** — professional, respectful, ≥ 20 characters
+
+Score drives loyalty tier changes and earns negotiation bonus (capped at Rs 30/episode). A traditional numerical RL policy cannot do this.
 
 ---
 
 ## Action Space
 
-**`SupplyChainAction`**
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `action_type` | `"order"` \| `"emergency_restock"` \| `"hold"` | What to do today |
-| `quantity` | `int` \| `None` | Units to order (required for order/emergency; `None` for hold) |
-
 ```json
-{"action_type": "order", "quantity": 150}
-{"action_type": "emergency_restock", "quantity": 50}
-{"action_type": "hold"}
+{
+  "action_type": "order" | "emergency_restock" | "hold",
+  "quantity": 120,
+  "sell_price": 268.0,
+  "negotiation_message": "As a consistent zero-default partner, we request priority allocation of 120 units with immediate advance payment of $24,000 to secure our position during this disruption."
+}
 ```
 
----
-
-## Observation Space
-
-**`SupplyChainObservation`**
-
 | Field | Type | Description |
 |-------|------|-------------|
-| `day` | `int` | Current day (1–30) |
-| `current_stock` | `int` | Units currently in warehouse |
-| `demand_forecast` | `float` | Forecasted demand for today |
-| `forecast_noise` | `"low"` \| `"medium"` \| `"high"` | Forecast uncertainty level |
-| `pending_orders` | `List[PendingOrder]` | Orders placed but not yet arrived |
-| `last_7_day_service_level` | `float` | Fraction of demand fulfilled over last 7 days |
-| `holding_cost_per_unit` | `float` | $0.50 per unit per day |
-| `stockout_penalty` | `float` | $50 per stockout event |
-| `budget_remaining` | `float` | Remaining budget in dollars |
-| `supplier_status` | `"normal"` \| `"delayed"` | Current supplier reliability |
-| `current_phase` | `"easy"` \| `"medium"` \| `"hard"` | Active difficulty phase |
-| `prompt` | `str` | Formatted natural-language prompt for LLM agents |
-| `done` | `bool` | True after day 30 |
-| `reward` | `float` | Step reward (dense, every step) |
-| `metadata` | `dict` | `phase_score`, `actual_demand`, `actual_fulfilled`, etc. |
+| `action_type` | `"order"` \| `"emergency_restock"` \| `"hold"` | Buy-side decision |
+| `quantity` | `int` \| `null` | Units to buy (null for hold) |
+| `sell_price` | `float` | Price per unit sold to customers today |
+| `negotiation_message` | `str` | Natural language message to your supplier |
+
+Missing any field → −10 penalty, day does NOT advance.
 
 ---
 
 ## Reward Function
 
-Reward is **dense** — the agent receives a signal every step:
-
 ```
-reward  = fulfilled_units × 3.0          # sell at $3/unit → $1 margin over $2 unit cost
-reward -= 50.0                            # if stockout occurred
-reward -= 0.5 × max(0, stock − 200)      # overstock penalty
-reward -= (20 + qty × 2)                 # if action = order
-reward -= (20 + qty × 6)                 # if action = emergency_restock
-reward += 5.0                            # if stock in [50, 200]  (efficiency bonus)
-reward -= 10.0                           # if action was malformed
+daily_reward = (sell_price - Rs 200) × units_fulfilled   # gross profit
+             - Rs 50.0                                     # if stockout
+             - Rs 20.0 × units_spoiled                    # spoilage penalty
+             - 0.5 × max(0, stock - 300)                  # overstock penalty
+             - order_cost                                  # fixed + unit × tier surcharge
+             + Rs 5.0                                      # if stock in [50, 300]
+             + neg_bonus                                   # negotiation score × 10 (capped Rs 30/ep)
+             - Rs 10.0                                     # malformed action
+             - Rs 100.0                                    # budget negative (signal only)
 ```
-
-**Optimal stock range: 50–200 units.** Below 50 risks stockouts; above 200 wastes holding cost.
 
 ---
 
@@ -119,109 +153,86 @@ reward -= 10.0                           # if action was malformed
 Each phase is scored independently:
 
 ```
-score = 0.5 × service_score + 0.3 × cost_score + 0.2 × validity_score
-
-service_score  = min(avg_service_level / phase_target, 1.0)
-cost_score     = max(0.0, 1.0 − total_cost / max_allowed_cost)
-validity_score = valid_actions / total_actions
+score = 0.30 × service_score
+      + 0.25 × profit_score
+      + 0.20 × cost_score
+      + 0.15 × spoilage_score
+      + 0.10 × validity_score
 ```
 
-Live `phase_score` is available in every observation's `metadata` field.
+| Component | Formula |
+|-----------|---------|
+| `service_score` | `min(fulfilled / demand / phase_target, 1.0)` |
+| `profit_score` | `min(total_revenue / phase_max_revenue, 1.0)` |
+| `cost_score` | `max(0, 1 - total_cost / phase_max_cost)` |
+| `spoilage_score` | `max(0, 1 - spoilage_rate × 5)` — 20%+ spoilage → 0 |
+| `validity_score` | `valid_actions / total_actions` |
+
+Phase targets: Easy SL ≥ 95% | Medium SL ≥ 85% | Hard SL ≥ 75%
 
 ---
 
-## Quick Start
+## Results
 
-### Python Client
+| Phase | Untrained Grade | Trained Grade | Improvement |
+|-------|----------------|---------------|-------------|
+| Easy   | X.XXX | X.XXX | +X.XXX |
+| Medium | X.XXX | X.XXX | +X.XXX |
+| Hard   | X.XXX | X.XXX | +X.XXX |
+| **Overall** | **X.XXX** | **X.XXX** | **+X.XXX** |
 
-```python
-from asc_agent_under_demand_uncertainity_rl_env import (
-    AscAgentUnderDemandUncertainityRlEnv,
-    SupplyChainAction,
-)
+*(Run Cell 8 of `training_colab.ipynb` to fill these with real numbers)*
 
-with AscAgentUnderDemandUncertainityRlEnv(base_url="http://localhost:8000") as env:
-    result = env.reset()
-    obs = result.observation
-    print(f"Day {obs.day} | Stock: {obs.current_stock} | Phase: {obs.current_phase}")
+![Training Reward](reward_curves.png)
+*GRPO training reward over steps — x: training step, y: step reward (Rs)*
 
-    while not result.done:
-        action = SupplyChainAction(action_type="order", quantity=100)
-        result = env.step(action)
-        obs = result.observation
-        print(
-            f"Day {obs.day:2d} | Stock: {obs.current_stock:4d} "
-            f"| Reward: {result.reward:+.1f} "
-            f"| SL: {obs.last_7_day_service_level:.0%} "
-            f"| Phase score: {obs.metadata['phase_score']:.3f}"
-        )
-```
-
-### Start a Specific Phase
-
-```python
-result = env.reset(task="hard_phase_inventory", seed=42)
-```
+![Grade Comparison](grade_comparison.png)
+*Grade score before vs after GRPO training across all three phases*
 
 ---
 
 ## Setup
 
-### Prerequisites
-
-- Python ≥ 3.10
-- [`uv`](https://docs.astral.sh/uv/) package manager
-- Docker (for containerised deployment)
-
 ### Install & Run Locally
 
 ```bash
-# Install dependencies
 uv sync
-
-# Start the server
 uvicorn server.app:app --reload --host 0.0.0.0 --port 8000
-```
-
-### Build & Run with Docker
-
-```bash
-# Build
-docker build -t asc-supply-chain:latest -f Dockerfile .
-
-# Run
-docker run -p 8000:8000 asc-supply-chain:latest
 ```
 
 ### Run Baseline Inference
 
 ```bash
-# Required: Hugging Face API key (free at https://huggingface.co/settings/tokens)
 export HF_TOKEN=hf_your_token_here
-
-# Optional overrides (defaults shown):
-export API_BASE_URL=https://router.huggingface.co/v1
-export MODEL_NAME=meta-llama/Llama-3.3-70B-Instruct
-export ENV_URL=http://localhost:8000  # override to use local server instead of HF Space
-
-# Run:
+export ENV_URL=http://localhost:8000   # or your HF Space URL
 python inference.py
+```
+
+### Docker
+
+```bash
+docker build -t supply-negotiate:latest -f Dockerfile .
+docker run -p 8000:8000 supply-negotiate:latest
+```
+
+### Deploy to Hugging Face Spaces
+
+```bash
+openenv push
+openenv push --repo-id my-org/supply-negotiate
 ```
 
 ---
 
-## Baseline Scores
+## Customising for a Specific Domain
 
-Baseline scores measured with `meta-llama/Llama-3.3-70B-Instruct` via HF router, `numpy seed=42`, `episode seed=0`:
+To configure the environment for a specific industry:
 
-| Phase  | Service Score | Cost Score | Validity Score | **Final Score** |
-|--------|--------------|------------|----------------|-----------------|
-| Easy   | —            | —          | —              | **0.6334**      |
-| Medium | —            | —          | —              | **0.5152**      |
-| Hard   | —            | —          | —              | **0.5290**      |
-| **Overall** |         |            |                | **0.5592**      |
+1. Update the `prompt` field in `_build_observation()` to use your domain's terminology (product name, unit name, customer type)
+2. Adjust `SHELF_LIFE_DAYS`, `MARKET_PRICE`, and `BASE_DEMAND` constants to match your product's economics
+3. Update `SUPPLIER_MESSAGES` templates to match your industry's communication style
 
-Score formula: `0.5 × service_score + 0.3 × cost_score + 0.2 × validity_score`
+No reward logic, grader logic, or rubric code changes are needed.
 
 ---
 
@@ -229,47 +240,20 @@ Score formula: `0.5 × service_score + 0.3 × cost_score + 0.2 × validity_score
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/reset` | POST | Reset environment (accepts `task`, `seed` params) |
-| `/step`  | POST | Execute an action |
+| `/reset` | POST | Start episode — accepts `task`, `seed` params |
+| `/step`  | POST | Submit 4-field action, receive observation + reward |
 | `/state` | GET  | Current episode state |
 | `/schema`| GET  | Action / observation JSON schemas |
-| `/ws`    | WS   | Persistent WebSocket session (low latency) |
+| `/ws`    | WS   | Persistent WebSocket session (up to 4 concurrent) |
 | `/health`| GET  | Container health check |
 | `/docs`  | GET  | Interactive Swagger UI |
-| `/web`   | GET  | Web interface for manual exploration |
+| `/web`   | GET  | Browser UI for manual exploration |
 
 ---
 
-## Project Structure
+## Links
 
-```
-asc_agent_under_demand_uncertainity_rl_env/
-├── Dockerfile          # Container image (at project root — hackathon requirement)
-├── openenv.yaml        # OpenEnv manifest with 3 task definitions
-├── pyproject.toml      # Project metadata and dependencies
-├── models.py           # SupplyChainAction, SupplyChainObservation, PendingOrder
-├── client.py           # Python client (WebSocket-based)
-├── graders.py          # Phase graders returning 0.0–1.0
-├── inference.py        # Baseline agent (meta-llama/Llama-3.3-70B-Instruct via HF router)
-├── __init__.py         # Package exports
-└── server/
-    ├── app.py          # FastAPI application
-    └── asc_agent_under_demand_uncertainity_rl_env_environment.py  # Core simulation
-```
-
----
-
-## Deploying to Hugging Face Spaces
-
-```bash
-# Push to your namespace
-openenv push
-
-# Push to a specific repo
-openenv push --repo-id my-org/asc-supply-chain
-
-# Push as private
-openenv push --private
-```
-
-The deployed space includes a web UI at `/web` and full API docs at `/docs`.
+- [HuggingFace Space](#) — live environment
+- [Training Notebook](training_colab.ipynb) — GRPO training with Qwen2.5-7B
+- [Demo Video](#)
+- [HF Blog Post](#)

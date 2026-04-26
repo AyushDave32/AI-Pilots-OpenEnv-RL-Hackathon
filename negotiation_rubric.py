@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-Negotiation rubric for the PharmaNegotiate Supply Chain RL Environment.
+Negotiation rubric for the Adaptive Supply Chain RL Environment.
 
 Scores the agent's daily `negotiation_message` using an LLM-as-Judge approach.
 The judge evaluates 3 criteria that require genuine language understanding:

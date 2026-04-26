@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-Episode graders for the PharmaNegotiate Supply Chain RL Environment.
+Episode graders for the Adaptive Supply Chain RL Environment.
 
 Each grader evaluates a completed phase and returns a score in [0.0, 1.0].
 
