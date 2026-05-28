@@ -115,6 +115,8 @@ class AscAgentUnderDemandUncertainityRlEnvironment(Environment):
         self._last_lead_promised: int = 3
         self._supplier_neg_threshold_bonus: float = 0.0
 
+        self._initialized: bool = False
+
         # Last-step observable supplier signals (built in step, read in _build_observation)
         self._supplier_last_message: str = ""
         self._lead_time_accuracy: str = "on time"
@@ -183,6 +185,8 @@ class AscAgentUnderDemandUncertainityRlEnvironment(Environment):
         self._phase_valid_actions = 0
         self._phase_total_actions = 0
 
+        self._initialized = True
+
         # Initial stock — expires day 16 to create urgency entering medium phase
         init_qty = int(self._rng.integers(150, 301))
         self._stock_batches.append(
@@ -197,6 +201,8 @@ class AscAgentUnderDemandUncertainityRlEnvironment(Environment):
         # STEP 1 — Guard
         if self._done:
             raise RuntimeError("Episode is done. Call reset() first.")
+        if not self._initialized:
+            self.reset()
 
         # STEP 2 — Validate action
         malformed = False
